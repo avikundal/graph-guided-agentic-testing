@@ -1,0 +1,26 @@
+# ---- Secrets & credentials (NEVER commit) ----
+.env
+.env.*
+!.env.example
+
+# ---- Captured session / personal data ----
+data/amazon_auth.json
+data/amazon_auth.json.bak
+data/browser_profile/
+data/screenshots/
+data/artifacts/
+data/run_logs/
+
+# ---- Python ----
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ---- OS / editor ----
+.DS_Store
+*.swp
+.idea/
+.vscode/

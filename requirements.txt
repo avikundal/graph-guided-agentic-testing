@@ -1,0 +1,6 @@
+playwright>=1.44.0
+python-dotenv>=1.0.1
+neo4j>=5.20.0
+openai>=1.40.0
+pytest>=8.2.0
+browser-use>=0.13.1
