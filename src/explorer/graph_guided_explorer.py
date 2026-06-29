@@ -778,7 +778,10 @@ class GraphGuidedExplorer:
     def _event(self, kind: str, label: str, state: str, status: str, source: str, evidence: list[str]) -> None:
         self.events.append(ExplorationEvent(len(self.events) + 1, kind, label, state, status, source, evidence))
         if self.debug:
-            print(f"[dfs][event] {kind.upper()} {label} state={state} status={status} source={source} evidence={evidence[:3]}")
+            # quiet mode: only print important events (clicked, blocked, key transitions)
+            quiet_skip = {"found", "observed", "frontier", "replay"}
+            if kind.lower() not in quiet_skip:
+                print(f"[dfs][event] {kind.upper()} {label} state={state} status={status} source={source} evidence={evidence[:3]}")
 
 
 def _looks_like_dom_line(line: str) -> bool:
