@@ -14,6 +14,14 @@ load_dotenv()
 from src.config import settings
 from src.explorer.graph_guided_explorer import GraphGuidedExplorer
 
+import logging
+
+logging.getLogger("browser_use").setLevel(logging.ERROR)
+logging.getLogger("browser-use").setLevel(logging.ERROR)
+logging.getLogger("Agent").setLevel(logging.ERROR)
+logging.getLogger("BrowserSession").setLevel(logging.ERROR)
+logging.getLogger("service").setLevel(logging.ERROR)
+logging.getLogger("tools").setLevel(logging.ERROR)
 
 async def run(args):
     product_url = args.url or settings.target_product_url

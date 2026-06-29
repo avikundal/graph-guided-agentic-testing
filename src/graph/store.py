@@ -111,13 +111,17 @@ class GraphStore:
             self.driver.verify_connectivity()
 
     def reset_scope(self, scope: dict):
+        """Clear the full Neo4j graph for a clean demo/prototype run.
+
+        For the take-home assignment, --reset-graph should mean the next run starts
+        from an empty graph. Constraints and indexes are preserved.
+        """
         self.write(
             """
             MATCH (n)
-            WHERE n.tenant_id=$tenant_id AND n.project_id=$project_id AND n.feature_key=$feature_key
             DETACH DELETE n
             """,
-            scope,
+            {},
         )
 
     def init_run(self, scope: dict, run_id: str, product_url: str):

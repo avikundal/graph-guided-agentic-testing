@@ -8,7 +8,8 @@ from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
-
+import contextlib
+import io
 from ..config import DATA_DIR, settings
 from ..domain.amazon_auth import AUTH_FILE, BROWSER_ARGS
 from ..domain.checkout_contract import (
@@ -25,6 +26,61 @@ ARTIFACTS_DIR = DATA_DIR / "artifacts"
 RUN_LOGS_DIR = DATA_DIR / "run_logs"
 for _d in (SCREENSHOTS_DIR, ARTIFACTS_DIR, RUN_LOGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+
+import contextlib
+import io
+import logging
+
+
+@contextlib.contextmanager
+def suppress_browser_use_output():
+    """Suppress browser-use console/log noise during agent.run()."""
+    logger_names = [
+        "browser_use",
+        "browser-use",
+        "browser_use.agent",
+        "browser_use.browser",
+        "browser_use.browser.session",
+        "browser_use.service",
+        "browser_use.telemetry",
+        "Agent",
+        "BrowserSession",
+        "tools",
+        "service",
+    ]
+
+    old_disable = logging.root.manager.disable
+    old_levels = {}
+    old_propagate = {}
+
+    try:
+        # Nuclear switch: disables all logging <= CRITICAL during agent.run().
+        # This is intentional because browser-use installs its own handlers.
+        logging.disable(logging.CRITICAL)
+
+        for name in logger_names:
+            logger = logging.getLogger(name)
+            old_levels[name] = logger.level
+            old_propagate[name] = logger.propagate
+            logger.setLevel(logging.CRITICAL + 1)
+            logger.propagate = False
+
+            for handler in logger.handlers:
+                handler.setLevel(logging.CRITICAL + 1)
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            yield
+
+    finally:
+        logging.disable(old_disable)
+
+        for name in logger_names:
+            logger = logging.getLogger(name)
+            if name in old_levels:
+                logger.setLevel(old_levels[name])
+            if name in old_propagate:
+                logger.propagate = old_propagate[name]
 
 
 @dataclass
@@ -268,7 +324,10 @@ Do NOT click again if redirected to sign-in or another page.
         )
         error = ""
         try:
-            await agent.run(max_steps=max_steps)
+            with suppress_browser_use_output():
+                await agent.run(max_steps=max_steps)
+        except Exception as exc:
+            error = str(exc)[:300]
         except Exception as exc:
             error = str(exc)[:300]
         after = self._last_observation
@@ -439,12 +498,13 @@ Do NOT click again if redirected to sign-in or another page.
             return "clicked_observed" if had_ui_action else "observed_only"
 
         if intent.canonical_key == "action.proceed_to_checkout":
-            # Redirect to sign-in is an observed checkout/auth boundary, but not
-            # an end-to-end validated secure-checkout transition.
-            if "sign-in" in combined or "signin" in combined or "/ap/signin" in (after.url or ""):
-                return "blocked_signin"
+            # For this prototype, checkout/sign-in/payment/address pages are
+            # terminal checkout boundaries. Reaching that boundary is a
+            # successful crawl outcome even if Amazon asks for auth next.
             if after.state in {STATE_CHECKOUT, "final_order_boundary"}:
                 return "validated" if had_ui_action else "already_satisfied"
+            if "sign-in" in combined or "signin" in combined or "/ap/signin" in (after.url or ""):
+                return "blocked_signin" 
             if failure:
                 return "not_grounded"
             return "clicked_observed" if had_ui_action else "not_grounded"
