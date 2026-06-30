@@ -432,18 +432,21 @@ Do NOT click again if redirected to sign-in or another page.
         except Exception:
             action = None
         action_type = _action_type(action) if action is not None else "observe"
-        target = _action_target_label(action) if action is not None else self._current_task
+        # Resolve the PRECISE element label (its text/aria) for the thing being
+        # acted on — not browser-use's verbose page summary. This keeps the report
+        # legible AND makes the veto precise: a done() summary that merely mentions
+        # "Buy now" must not trigger a false payment veto.
+        el_label = _element_label_for_action(action, obs) if action is not None else ""
+        target = el_label or (_action_target_label(action) if action is not None else self._current_task)
         selector = _resolve_selector(action, browser_state) if action is not None else ""
 
-        # DENY-LIST VETO — runs before the action executes. Block only final
-        # payment and off-product navigation; everything else is allowed so the
-        # agent can freely discover new scenarios.
-        if action is not None:
+        # DENY-LIST VETO — runs before the action executes. Only for actions that
+        # actually do something (click/select/navigate), using the precise label.
+        if action_type in {"click", "select", "navigate", "go_back", "go_to_url"}:
             from .safety_guard import ForbiddenActionVeto, veto_reason
-            action_url = _action_url(action)
             reason = veto_reason(
-                target_label=target,
-                action_url=action_url,
+                target_label=el_label if action_type in {"click", "select"} else "",
+                action_url=_action_url(action),
                 action_type=action_type,
                 product_asin=self._safety_product_asin,
                 base_host=self._safety_base_host,
@@ -798,6 +801,31 @@ def _action_target_label(action: Any) -> str:
             if val not in (None, ""):
                 return f"{key}={val}"[:160]
     return type(action).__name__
+
+
+def _element_label_for_action(action: Any, obs: Any) -> str:
+    """Resolve the human label (text/aria) of the element an action targets, by
+    matching the action's element index against the observed elements. Returns ""
+    for fills/navigations (no element index) so the caller can fall back."""
+    if action is None or not hasattr(action, "model_dump"):
+        return ""
+    try:
+        flat = _flatten(action.model_dump())
+    except Exception:
+        return ""
+    idx = flat.get("index")
+    if idx in (None, ""):
+        return ""
+    try:
+        idx = int(idx)
+    except Exception:
+        return ""
+    for el in getattr(obs, "elements", None) or []:
+        if getattr(el, "index", None) == idx:
+            lbl = (getattr(el, "aria_label", "") or getattr(el, "text", "")
+                   or getattr(el, "value", "") or getattr(el, "name", "") or "")
+            return " ".join(lbl.split())[:60]
+    return ""
 
 
 def _resolve_selector(action: Any, browser_state: Any) -> str:

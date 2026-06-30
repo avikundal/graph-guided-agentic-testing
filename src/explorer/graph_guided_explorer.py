@@ -301,7 +301,7 @@ class GraphGuidedExplorer:
 
         # 2) Open the canonical cart and confirm the item landed.
         cart = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Open cart after product exploration")
-        await self._observe_update_frontier(cart.observation, source=SOURCE_CRAWLER)
+        await self._ingest_observation(cart.observation, source=SOURCE_CRAWLER)
         if (_cart_item_count(cart.observation) or 0) > 0:
             self.add_to_cart_validated = True
             self.cart_provenance = "cart_confirmation_or_cart_delta_verified"
@@ -310,7 +310,7 @@ class GraphGuidedExplorer:
             self.observed_concepts.update({"action.add_to_cart", "domain.cart_item"})
         else:
             restored = await self._restore_product_to_cart()
-            await self._observe_update_frontier(restored, source=SOURCE_CRAWLER)
+            await self._ingest_observation(restored, source=SOURCE_CRAWLER)
             if (_cart_item_count(restored) or 0) > 0:
                 self.add_to_cart_validated = True
 
@@ -326,7 +326,7 @@ class GraphGuidedExplorer:
         cart2_obs = cart2.observation
         if (_cart_item_count(cart2_obs) or 0) == 0:
             cart2_obs = await self._restore_product_to_cart()
-        await self._observe_update_frontier(cart2_obs, source=SOURCE_CRAWLER)
+        await self._ingest_observation(cart2_obs, source=SOURCE_CRAWLER)
 
         # 5) Graph reasons about what the crawl missed.
         self._infer_graph_scenarios()
@@ -342,7 +342,7 @@ class GraphGuidedExplorer:
             self.checkout_reached = True
             self.proceed_to_checkout_validated = True
             self.observed_concepts.add("domain.checkout_boundary")
-            await self._observe_update_frontier(final_obs, source=SOURCE_CRAWLER)
+            await self._ingest_observation(final_obs, source=SOURCE_CRAWLER)
         self._infer_graph_scenarios()
         self.log("stop", "autonomous exploration complete")
 
@@ -584,6 +584,23 @@ class GraphGuidedExplorer:
             cart_nav = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Open full cart after add")
             after = cart_nav.observation
         obs = await self._observe_update_frontier(after, source=SOURCE_CRAWLER)
+        return obs
+
+    async def _ingest_observation(self, obs: PageObservation, *, source: str) -> PageObservation:
+        """Ingestion only (no catalogue/dynamic/neighbor discovery): write the
+        observation + its typed concepts into the graph. Used by the autonomous
+        crawl, where browser-use is the discovery engine — not the catalogue."""
+        self._capture_identity_from_observation(obs)
+        self.step += 1
+        self.visited_states.add(obs.state)
+        self.observed_concepts |= obs.detected_concepts
+        self.graph.write_observation(self.scope, self.run_id, self.step, obs)
+        signature = f"{obs.state}:{','.join(sorted(obs.detected_concepts))}:{len(obs.elements)}"
+        if signature not in self.observed_signatures:
+            self.observed_signatures.add(signature)
+            evidence = sorted(obs.detected_concepts)[:8]
+            state_ev = obs.state_evidence.get(obs.state, [])[:3]
+            self._event("observed", f"Observe {obs.state}", obs.state, "observed", source, evidence + state_ev)
         return obs
 
     async def _observe_update_frontier(self, obs: PageObservation, *, source: str) -> PageObservation:
