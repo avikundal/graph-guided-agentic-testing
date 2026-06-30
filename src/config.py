@@ -21,6 +21,7 @@ class Settings:
     neo4j_database: str = os.getenv("NEO4J_DATABASE", "neo4j")
     openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    openai_base_url: str | None = os.getenv("OPENAI_BASE_URL")
     target_product_url: str = os.getenv("TARGET_PRODUCT_URL", "https://www.amazon.com/dp/0307887898")
 
     @property
