@@ -294,55 +294,47 @@ class GraphGuidedExplorer:
             "structural_gaps_flagged": coverage.get("absent", []),
         }
 
+    # Convergence budgets for the dynamic loop (also bound cost/time).
+    _CRAWL_MAX_ROUNDS = 3
+    _GRAPH_MAX_ROUNDS = 3
+
     async def _autonomous_loop(self, current_obs: PageObservation) -> None:
-        """Two-engine crawl: browser-use explores each state autonomously (it
-        chooses its own actions, the deny-list veto keeps it safe), then the graph
-        reasons over what it found. No catalogue, no scripted intents.
+        """Dynamic two-engine loop: let browser-use run FREE until it stops finding
+        new concepts (crawl convergence), THEN let the graph close the gaps —
+        reasoning about what was missed and probing it — repeating until the graph
+        produces nothing new (graph convergence). Then proceed to checkout.
         """
-        # 1) Product page — let it try options, then add to cart.
+        # Seed: add the product to the cart so there is a cart to explore.
         res = await self.executor.explore_autonomously(
-            goal="You are on a product page. First try any product options you see (size, colour, style, quantity), then add the product to the cart.",
-            expected_state=STATE_PRODUCT, max_steps=10,
+            goal="You are on a product page. Try any product options you see (size, colour, quantity), then add THIS product to the cart.",
+            expected_state=STATE_PRODUCT, max_steps=8,
         )
         self._ingest_autonomous(res, STATE_PRODUCT)
+        await self._open_cart_after_add()
 
-        # 2) Open the canonical cart and confirm the item landed.
-        cart = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Open cart after product exploration")
-        await self._ingest_observation(cart.observation, source=SOURCE_CRAWLER)
-        if (_cart_item_count(cart.observation) or 0) > 0:
-            self.add_to_cart_validated = True
-            self.cart_provenance = "cart_confirmation_or_cart_delta_verified"
-            if not self.cart_preexisting:
-                self.cart_delta_verified = True
-            self.observed_concepts.update({"action.add_to_cart", "domain.cart_item"})
-        else:
-            restored = await self._restore_product_to_cart()
-            await self._ingest_observation(restored, source=SOURCE_CRAWLER)
-            if (_cart_item_count(restored) or 0) > 0:
-                self.add_to_cart_validated = True
+        # ---- PHASE A: crawl runs FREE until a round adds no new concept ----
+        prev = -1
+        crawl_rounds = 0
+        while crawl_rounds < self._CRAWL_MAX_ROUNDS and len(self.observed_concepts) != prev:
+            prev = len(self.observed_concepts)
+            crawl_rounds += 1
+            res = await self.executor.explore_autonomously(
+                goal="Test this shopping cart freely. Try controls you have NOT tried yet: change quantity, save for later, move to cart, remove/delete an item, apply a coupon/offer, gift options. Observe what changes after each.",
+                expected_state=STATE_CART, max_steps=12,
+            )
+            self._ingest_autonomous(res, STATE_CART)
+            await self._reobserve_cart_restore()
+            self.log("crawl", f"free-crawl round {crawl_rounds}: {len(self.observed_concepts)} concepts known")
 
-        # 3) Cart — explore the cart controls freely.
-        res2 = await self.executor.explore_autonomously(
-            goal="You are on the shopping cart. Test the cart controls: change the quantity, save an item for later, remove/delete an item, apply a coupon or offer if present, try gift options. Try each available control once and observe what changes.",
-            expected_state=STATE_CART, max_steps=16,
-        )
-        self._ingest_autonomous(res2, STATE_CART)
-
-        # 4) Re-read the cart; restore the product if exploration emptied it.
-        cart2 = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart after exploration")
-        cart2_obs = cart2.observation
-        if (_cart_item_count(cart2_obs) or 0) == 0:
-            cart2_obs = await self._restore_product_to_cart()
-        await self._ingest_observation(cart2_obs, source=SOURCE_CRAWLER)
-
-        # 5) Graph reasons about what the crawl missed.
-        self._infer_graph_scenarios()
-
-        # 5b) ENGINE 2 — LLM-over-graph: read the graph (what was discovered +
-        # validated, what's expected, what's expected-but-absent) and reason about
-        # what the crawl MISSED, then feed those probes back to the crawl.
-        missed = await self._graph_expansion(STATE_CART)
-        if missed:
+        # ---- PHASE B: the graph closes the gaps until it yields nothing new ----
+        graph_rounds = 0
+        while graph_rounds < self._GRAPH_MAX_ROUNDS:
+            graph_rounds += 1
+            self._infer_graph_scenarios()
+            missed = await self._graph_expansion(STATE_CART)
+            if not missed:
+                break
+            before = len(self.observed_concepts)
             probes = "; ".join(m["probe"] for m in missed[:4])
             surfaced_concepts = {m["concept"] for m in missed if m.get("concept")}
             res_probe = await self.executor.explore_autonomously(
@@ -353,14 +345,12 @@ class GraphGuidedExplorer:
                 expected_state=STATE_CART, max_steps=12,
             )
             self._ingest_autonomous(res_probe, STATE_CART, source=SOURCE_GRAPH, graph_concepts=surfaced_concepts)
-            cart3 = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart after graph-probed scenarios")
-            cart3_obs = cart3.observation
-            if (_cart_item_count(cart3_obs) or 0) == 0:
-                cart3_obs = await self._restore_product_to_cart()
-            await self._ingest_observation(cart3_obs, source=SOURCE_CRAWLER)
-            self._infer_graph_scenarios()
+            await self._reobserve_cart_restore()
+            self.log("graph", f"gap-closing round {graph_rounds}: surfaced {len(missed)}, concepts now {len(self.observed_concepts)}")
+            if len(self.observed_concepts) == before:
+                break  # the graph's probes revealed nothing new -> converged
 
-        # 6) Proceed to the checkout boundary. The veto guarantees no order is placed.
+        # ---- PHASE C: proceed to the checkout boundary (veto prevents ordering) ----
         res3 = await self.executor.explore_autonomously(
             goal="Click 'Proceed to Checkout' to reach the secure checkout page. Do NOT place an order or pay — stop as soon as the checkout page appears.",
             expected_state=STATE_CART, max_steps=4,
@@ -373,7 +363,35 @@ class GraphGuidedExplorer:
             self.observed_concepts.add("domain.checkout_boundary")
             await self._ingest_observation(final_obs, source=SOURCE_CRAWLER)
         self._infer_graph_scenarios()
-        self.log("stop", "autonomous exploration complete")
+        self.log("stop", f"converged after {crawl_rounds} free-crawl + {graph_rounds} graph round(s)")
+
+    async def _open_cart_after_add(self) -> PageObservation:
+        """Open the canonical cart after the seed add; confirm the item landed
+        (restore if not), and set the add-to-cart assertion."""
+        cart = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Open cart after add")
+        obs = cart.observation
+        if (_cart_item_count(obs) or 0) > 0:
+            self.add_to_cart_validated = True
+            self.cart_provenance = "cart_confirmation_or_cart_delta_verified"
+            if not self.cart_preexisting:
+                self.cart_delta_verified = True
+            self.observed_concepts.update({"action.add_to_cart", "domain.cart_item"})
+        else:
+            obs = await self._restore_product_to_cart()
+            if (_cart_item_count(obs) or 0) > 0:
+                self.add_to_cart_validated = True
+        await self._ingest_observation(obs, source=SOURCE_CRAWLER)
+        return obs
+
+    async def _reobserve_cart_restore(self) -> PageObservation:
+        """Re-read the canonical cart between rounds; restore the product if a
+        destructive/save action emptied it, then ingest the observation."""
+        cart = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart re-observe")
+        obs = cart.observation
+        if (_cart_item_count(obs) or 0) == 0:
+            obs = await self._restore_product_to_cart()
+        await self._ingest_observation(obs, source=SOURCE_CRAWLER)
+        return obs
 
     def _ingest_autonomous(self, res: BrowserUseResult, state: str, *, source: str = SOURCE_CRAWLER,
                            graph_concepts: set[str] | None = None) -> None:
