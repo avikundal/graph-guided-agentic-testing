@@ -20,6 +20,7 @@ ones — this layer only widens *discovery*, never the safety envelope.
 """
 from __future__ import annotations
 
+import html
 import re
 
 from ..domain.checkout_contract import (
@@ -96,6 +97,36 @@ def _slug(text: str) -> str:
     return s[:40] or "control"
 
 
+def _decode(s: str) -> str:
+    # Amazon aria-labels are sometimes double-escaped (&amp;#39;), so unescape twice.
+    return html.unescape(html.unescape(s or "")).strip()
+
+
+# Cart-line controls carry the whole product title in their aria-label
+# ("Delete Allen Solly Men's Polo (8907...)"). Collapse to the clean action verb
+# so the report reads "Delete item", not a 60-char product code string.
+_CLEAN_PREFIX = (
+    ("decrease quantity", "Decrease quantity"),
+    ("increase quantity", "Increase quantity"),
+    ("change quantity", "Change quantity"),
+    ("save for later", "Save for later"),
+    ("move to cart", "Move to cart"),
+    ("add to list", "Add to list"),
+    ("add to wish", "Add to wish list"),
+    ("delete", "Delete item"),
+    ("remove", "Remove item"),
+)
+
+
+def _clean_label(label: str) -> str:
+    s = _decode(label)
+    low = s.lower()
+    for prefix, clean in _CLEAN_PREFIX:
+        if low.startswith(prefix):
+            return clean
+    return re.sub(r"\s+", " ", s)[:48]
+
+
 # Tokens that mark a string as an internal DOM identifier / widget scaffolding
 # rather than a human-meaningful control label. Amazon's variant ("twister")
 # widgets expose dozens of these (a-autoid-N-announce, inline-twister-*,
@@ -126,7 +157,7 @@ def _label_for(el: UIElement) -> str:
     # Prefer human-readable accessible text; skip any candidate that is actually
     # an internal identifier. id/name are deliberately NOT used as labels.
     for cand in (el.aria_label, el.text, el.value):
-        c = re.sub(r"\s+", " ", (cand or "").strip())
+        c = re.sub(r"\s+", " ", _decode(cand))
         if c and not c.startswith("<") and not _looks_like_internal_id(c):
             return c[:60]
     return ""
@@ -135,7 +166,7 @@ def _label_for(el: UIElement) -> str:
 def _aliases_for(el: UIElement, label: str) -> list[str]:
     out: list[str] = []
     for cand in (label, el.text, el.aria_label, el.value, el.name):
-        c = (cand or "").strip().lower()
+        c = _decode(cand).lower()
         if c and c not in out and not c.startswith("<"):
             out.append(c[:40])
     return out[:8]
@@ -263,12 +294,13 @@ def discover_dynamic_intents(
             continue
         risk, reason = classified
 
-        canonical_key = f"dynamic.{_slug(label)}"
+        clean_label = _clean_label(label)
+        canonical_key = f"dynamic.{_slug(clean_label)}"
         clickable_risk = risk in {RISK_SAFE_CLICK, RISK_MUTATING_CLICK, RISK_DESTRUCTIVE_CLICK}
         selectors = [el.selector] if el.selector else []
         ni = NormalizedIntent(
             canonical_key=canonical_key,
-            human_label=label if len(label) > 2 else f"Option: {label}",
+            human_label=clean_label if len(clean_label) > 2 else f"Option: {clean_label}",
             expected_state=obs.state,
             source=source,
             risk=risk,
