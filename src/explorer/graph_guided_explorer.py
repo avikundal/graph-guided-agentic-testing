@@ -124,6 +124,9 @@ class GraphGuidedExplorer:
         self.crawl_validated_concepts: set[str] = set()
         self.graph_surfaced_scenarios: list[dict] = []
         self.graph_directed_clicks = 0
+        # Distinct action labels actually clicked — the action-level signal that
+        # tells us the crawler has genuinely run dry (richer than concept count).
+        self.clicked_labels: set[str] = set()
 
     def log(self, kind: str, msg: str) -> None:
         if self.debug:
@@ -298,8 +301,9 @@ class GraphGuidedExplorer:
             "structural_gaps_flagged": coverage.get("absent", []),
         }
 
-    # Convergence budgets for the dynamic loop (also bound cost/time).
-    _CRAWL_MAX_ROUNDS = 3
+    # Convergence budgets for the dynamic loop (also bound cost/time). Phase A
+    # may take a few progress rounds + 2 stagnant rounds, so the cap is higher.
+    _CRAWL_MAX_ROUNDS = 5
     _GRAPH_MAX_ROUNDS = 3
 
     async def _autonomous_loop(self, current_obs: PageObservation) -> None:
@@ -316,19 +320,32 @@ class GraphGuidedExplorer:
         self._ingest_autonomous(res, STATE_PRODUCT)
         await self._open_cart_after_add()
 
-        # ---- PHASE A: crawl runs FREE until a round adds no new concept ----
-        prev = -1
+        # ---- PHASE A: crawl runs FREE until ACTION-LEVEL stagnation ----
+        # Stop only after 2 consecutive rounds with no new concept, no new clicked
+        # label, AND no new validated concept — not merely no new canonical concept.
+        # Many distinct controls collapse onto one concept (increase vs decrease
+        # quantity, save-then-restore, invalid coupon, remove the last item), so
+        # concept-count alone would stop while real controls sit untried.
+        last_cart = current_obs
+        stagnant = 0
+        prev_sig = None
         crawl_rounds = 0
-        while crawl_rounds < self._CRAWL_MAX_ROUNDS and len(self.observed_concepts) != prev:
-            prev = len(self.observed_concepts)
+        while crawl_rounds < self._CRAWL_MAX_ROUNDS and stagnant < 2:
             crawl_rounds += 1
+            untried = self._untried_visible_labels(last_cart)
+            hint = (" Controls you have NOT tried yet include: " + "; ".join(sorted(untried)[:6]) + ".") if untried else ""
             res = await self.executor.explore_autonomously(
-                goal="Test this shopping cart freely. Try controls you have NOT tried yet: change quantity, save for later, move to cart, remove/delete an item, apply a coupon/offer, gift options. Observe what changes after each.",
+                goal=("Test this shopping cart thoroughly. Try EVERY distinct control you have not "
+                      "tried yet — increase AND decrease quantity, save for later, move back to cart, "
+                      "remove/delete, apply a coupon (try an invalid one too), gift options." + hint),
                 expected_state=STATE_CART, max_steps=12,
             )
             self._ingest_autonomous(res, STATE_CART)
-            await self._reobserve_cart_restore()
-            self.log("crawl", f"free-crawl round {crawl_rounds}: {len(self.observed_concepts)} concepts known")
+            last_cart = await self._reobserve_cart_restore()
+            sig = (len(self.observed_concepts), len(self.clicked_labels), len(self.crawl_validated_concepts))
+            stagnant = stagnant + 1 if sig == prev_sig else 0
+            prev_sig = sig
+            self.log("crawl", f"round {crawl_rounds}: concepts={sig[0]} labels={sig[1]} validated={sig[2]} untried={len(untried)} stagnant={stagnant}")
 
         # ---- PHASE B: the graph closes the gaps until it yields nothing new ----
         graph_rounds = 0
@@ -392,6 +409,27 @@ class GraphGuidedExplorer:
         self.executor.set_product_title(self.product_title or self.cart_title)
         return obs
 
+    def _untried_visible_labels(self, obs: PageObservation) -> set[str]:
+        """Visible, interactable controls on the cart that the crawler has NOT
+        clicked yet (scoped to the item under test). Drives the 'are we really
+        done?' signal and hints the next burst toward unexplored controls."""
+        brand = product_tokens(self.product_title or self.cart_title)
+        out: set[str] = set()
+        for el in getattr(obs, "elements", None) or []:
+            if not getattr(el, "visible", False) or getattr(el, "in_nav_or_header", False):
+                continue
+            if not (getattr(el, "clickable", False) or getattr(el, "interactable", False)):
+                continue
+            lbl = " ".join((getattr(el, "aria_label", "") or getattr(el, "text", "")
+                            or getattr(el, "value", "") or "").split())
+            low = lbl.lower()[:60]
+            if len(low) < 3 or low.startswith("<") or low in self.clicked_labels:
+                continue
+            if is_other_product_label(lbl, brand):
+                continue
+            out.add(low)
+        return out
+
     async def _reobserve_cart_restore(self) -> PageObservation:
         """Re-read the canonical cart between rounds; restore the product if a
         destructive/save action emptied it, then ingest the observation."""
@@ -431,6 +469,7 @@ class GraphGuidedExplorer:
             # slipped past the veto — keeps the graph scoped to the item under test.
             if is_other_product_label(label, title_tokens):
                 continue
+            self.clicked_labels.add(key)  # action-level convergence signal
             concept = _action_to_concept(label)
             act_state = art.state or state
             is_graph = probe and concept is not None and concept in graph_concepts
