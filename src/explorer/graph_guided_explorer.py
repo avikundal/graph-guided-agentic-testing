@@ -84,6 +84,8 @@ class GraphGuidedExplorer:
         self.debug = debug
 
         self.executor = BrowserUseIntentExecutor(headless=headless, debug=debug)
+        # Deny-list safety scope: block off-product navigation + final payment.
+        self.executor.set_safety_context(product_url)
         self.normalizer = SemanticNormalizer()
         self.frontier = IntentFrontier()
         self.neighbor_generator = NeighborGenerator()

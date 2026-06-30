@@ -141,6 +141,18 @@ class BrowserUseIntentExecutor:
         self._active_intent: NormalizedIntent | None = None
         self._task_execution_actions: list[BrowserUseStepArtifact] = []
         self._task_warnings: list[str] = []
+        # Deny-list safety context (set by the explorer). The veto blocks only
+        # final payment and off-product navigation; everything else is allowed.
+        self._safety_product_asin: str = ""
+        self._safety_base_host: str = ""
+        self._vetoes: list[str] = []
+
+    def set_safety_context(self, product_url: str) -> None:
+        """Tell the veto which product/marketplace is in scope so it can block
+        navigation to a different product or an external site."""
+        from .safety_guard import asin_from_url, host_of
+        self._safety_product_asin = asin_from_url(product_url)
+        self._safety_base_host = host_of(product_url)
 
     async def start(self) -> None:
         if self._browser_session is not None:
@@ -312,6 +324,7 @@ Do NOT click again if redirected to sign-in or another page.
         self._active_intent = intent
         self._task_execution_actions = []
         self._task_warnings = []
+        self._vetoes = []
         before = self._last_observation
         initial_actions = [{"navigate": {"url": start_url, "new_tab": False}}] if start_url else []
         agent = Agent(
@@ -345,6 +358,8 @@ Do NOT click again if redirected to sign-in or another page.
         selector = primary.selector if primary else ""
         if _looks_like_internal_action_url(after.url):
             error = (error + " | " if error else "") + "browser-use navigated to internal action-like URL; prompt/plumbing bug guarded"
+        if self._vetoes:
+            error = (error + " | " if error else "") + "safety_veto:" + ",".join(sorted(set(self._vetoes))[:4])
         if self._task_warnings:
             error = (error + " | " if error else "") + "; ".join(self._task_warnings[:4])
         artifact_json = _persist_artifact_bundle(self._task_counter, label, self._last_artifacts)
@@ -376,6 +391,25 @@ Do NOT click again if redirected to sign-in or another page.
         action_type = _action_type(action) if action is not None else "observe"
         target = _action_target_label(action) if action is not None else self._current_task
         selector = _resolve_selector(action, browser_state) if action is not None else ""
+
+        # DENY-LIST VETO — runs before the action executes. Block only final
+        # payment and off-product navigation; everything else is allowed so the
+        # agent can freely discover new scenarios.
+        if action is not None:
+            from .safety_guard import ForbiddenActionVeto, veto_reason
+            action_url = _action_url(action)
+            reason = veto_reason(
+                target_label=target,
+                action_url=action_url,
+                action_type=action_type,
+                product_asin=self._safety_product_asin,
+                base_host=self._safety_base_host,
+            )
+            if reason:
+                self._vetoes.append(reason)
+                if self.debug:
+                    print(f"[safety][veto] blocked action: {reason}")
+                raise ForbiddenActionVeto(reason)
         screenshot_path = _persist_screenshot(browser_state, self._task_counter, step_num)
         dom_excerpt = obs.text[:3000]
         artifact = BrowserUseStepArtifact(
@@ -687,6 +721,24 @@ def _action_type(action: Any) -> str:
     if "scroll" in joined:
         return "scroll"
     return "observe"
+
+
+def _action_url(action: Any) -> str:
+    """Best-effort extract a destination URL from a navigate-style action."""
+    if action is None:
+        return ""
+    try:
+        dumped = action.model_dump(exclude_none=True) if hasattr(action, "model_dump") else {}
+    except Exception:
+        return ""
+    if not isinstance(dumped, dict):
+        return ""
+    for v in dumped.values():
+        if isinstance(v, dict) and isinstance(v.get("url"), str):
+            return v["url"]
+        if isinstance(v, str) and v.startswith("http"):
+            return v
+    return ""
 
 
 def _action_target_label(action: Any) -> str:
