@@ -42,6 +42,7 @@ async def run(args):
         reset_graph=args.reset_graph,
         reset_cart=args.reset_cart,
         debug=args.debug,
+        autonomous=args.autonomous,
     )
     report = await explorer.run()
     print(report)
@@ -62,6 +63,7 @@ def main():
     p.add_argument("--debug", action="store_true")
     p.add_argument("--no-mutating", action="store_true", help="Do not execute mutating clicks like quantity changes/save-for-later.")
     p.add_argument("--no-destructive", action="store_true", help="Do not execute destructive clicks like delete/remove (default: they ARE executed and verified, then the cart is restored).")
+    p.add_argument("--autonomous", action="store_true", help="Phase 1b: let browser-use explore each state autonomously (it chooses its own actions) under the deny-list safety veto, instead of the catalogue-driven DFS.")
     args = p.parse_args()
     asyncio.run(run(args))
 

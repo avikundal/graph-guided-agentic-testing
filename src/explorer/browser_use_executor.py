@@ -234,6 +234,39 @@ Do not navigate to any URL. Do not invent a URL from this prompt text.
         # Longer runs let the agent keep planning and wander.
         return await self._run_agent_task(task, label=intent.human_label, start_url=None, max_steps=3, expected_state=intent.expected_state, intent=intent)
 
+    async def explore_autonomously(
+        self, *, goal: str, expected_state: str, max_steps: int = 10, start_url: str | None = None,
+    ) -> BrowserUseResult:
+        """Let browser-use explore freely (it chooses its own actions), with the
+        deny-list veto active. This is the crawl-discovery engine: the agent tries
+        whatever controls it finds, and we capture the trace as discovered
+        scenarios. Safety is the veto, not a script."""
+        await self.start()
+        task = self._exploration_task(goal, expected_state)
+        return await self._run_agent_task(
+            task, label=f"explore:{expected_state}", start_url=start_url,
+            max_steps=max_steps, expected_state=expected_state, intent=None,
+            max_actions_per_step=2,
+        )
+
+    def _exploration_task(self, goal: str, expected_state: str) -> str:
+        forbidden = "Buy Now, Place Order, Pay Now, Confirm Purchase, Complete Purchase, Submit Order"
+        expected_words = (expected_state or "").replace("_", " ")
+        return f"""
+You are an exploratory UI tester for a graph-guided testing system. Expected page/state: {expected_words}.
+
+{goal}
+
+You may freely click, select, and fill the controls you discover. Prefer trying MANY DIFFERENT controls (quantity, save-for-later, remove/delete, coupon/offer, gift options, product variants) one at a time, observing what changes after each — that variety is the whole point.
+
+HARD RULES — never break these:
+- NEVER click final purchase or payment: {forbidden}. Stop before any payment step.
+- Do NOT navigate to a DIFFERENT product or any external site. Stay on this product and its own cart/checkout.
+- Do not repeat a control you already tried.
+
+When you have exercised the available controls, call done with a short summary of what you tried and what changed.
+"""
+
     def _intent_task(self, intent: NormalizedIntent) -> str:
         """Build a browser-use task without URL-like internal identifiers.
 
@@ -316,6 +349,7 @@ Do NOT click again if redirected to sign-in or another page.
         max_steps: int,
         expected_state: str | None,
         intent: NormalizedIntent | None = None,
+        max_actions_per_step: int = 1,
     ) -> BrowserUseResult:
         from browser_use import Agent
         self._task_counter += 1
@@ -333,7 +367,7 @@ Do NOT click again if redirected to sign-in or another page.
             browser_session=self._browser_session,
             initial_actions=initial_actions,
             register_new_step_callback=self._on_step,
-            max_actions_per_step=1,
+            max_actions_per_step=max_actions_per_step,
         )
         error = ""
         try:
@@ -363,10 +397,19 @@ Do NOT click again if redirected to sign-in or another page.
         if self._task_warnings:
             error = (error + " | " if error else "") + "; ".join(self._task_warnings[:4])
         artifact_json = _persist_artifact_bundle(self._task_counter, label, self._last_artifacts)
-        evidence = self._evidence_for_result(intent, before, after, target, error)
-        if artifact_json:
-            evidence.append(f"artifact_json={artifact_json}")
-        status = self._status_for_result(intent, before, after, action_type, evidence, error)
+        if intent is None:
+            # Autonomous exploration burst: no single-intent verdict; just report
+            # what was tried and whether the veto fired.
+            evidence = [f"actions={len(self._task_execution_actions)}", f"final_state={after.state}"]
+            evidence += [f"veto={v}" for v in sorted(set(self._vetoes))[:3]]
+            if artifact_json:
+                evidence.append(f"artifact_json={artifact_json}")
+            status = "vetoed" if self._vetoes else ("explored" if self._task_execution_actions else "observed")
+        else:
+            evidence = self._evidence_for_result(intent, before, after, target, error)
+            if artifact_json:
+                evidence.append(f"artifact_json={artifact_json}")
+            status = self._status_for_result(intent, before, after, action_type, evidence, error)
         return BrowserUseResult(
             status=status,
             before=before,
