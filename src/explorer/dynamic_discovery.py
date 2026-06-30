@@ -57,12 +57,14 @@ _MUTATING_WORDS = (
     # cart-line actions
     "save for later", "move to cart", "move to list", "add to list",
     "gift option", "gift wrap", "gift receipt", "add gift",
+    # promotions / offers — now exercised, not just observed
+    "offer", "coupon", "promo", "voucher", "apply", "bank offer", "see all offers",
 )
 _SAFE_NAV_WORDS = ("continue to checkout", "continue", "go to checkout")
 # Inputs whose value would be a coupon/code. Discovered but kept observe-only,
 # because typing a real code blindly is a half-baked test; promo flows are a
 # follow-up that needs a seeded value.
-_CODE_INPUT_WORDS = ("promo", "coupon", "voucher", "gift card", "discount code", "code")
+_CODE_INPUT_WORDS = ("promo", "coupon", "voucher", "gift card", "discount code", "code", "offer")
 
 _GENERIC_SUCCESS = [
     "page or cart state visibly updated after the action",
@@ -195,10 +197,13 @@ def _classify(el: UIElement, haystack: str) -> tuple[str, str] | None:
     if any(w in haystack for w in _DESTRUCTIVE_WORDS):
         return RISK_DESTRUCTIVE_CLICK, "destructive cart control"
 
-    # 4) Coupon/code text inputs: record the capability, do not blind-fill.
-    if (el.tag or "").lower() == "input" and (el.type or "text").lower() in {"text", "", "search"}:
-        if any(w in haystack for w in _CODE_INPUT_WORDS):
-            return RISK_OBSERVE_ONLY, "promo/code input capability (observe-only)"
+    # 4) Promo / coupon / offer controls are now exercised as mutating actions
+    #    (expand / apply). A bare text input stays observe-only because blind
+    #    filling needs a seeded code; the apply/expand button is what we click.
+    if any(w in haystack for w in _CODE_INPUT_WORDS):
+        if (el.tag or "").lower() == "input" and (el.type or "text").lower() in {"text", "", "search"}:
+            return RISK_OBSERVE_ONLY, "promo/code text input (needs a seeded value to fill)"
+        return RISK_MUTATING_CLICK, "promo/coupon/offer control"
 
     # 5) Product options / variants / quantity / save-for-later — mutating clicks.
     if _is_option_control(el):

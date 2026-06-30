@@ -93,6 +93,17 @@ def test_promo_input_is_observe_only_not_blind_filled():
     assert intents[0].click_allowed is False
 
 
+def test_promo_and_offer_buttons_are_now_clickable():
+    # The apply/expand control (not a bare text box) should be exercised.
+    els = [
+        _el(1, "button", "Apply coupon", "button#applyPromo", aria_label="Apply coupon"),
+        _el(2, "a", "See all offers", "a#offers"),
+    ]
+    intents = discover_dynamic_intents(_obs(els, state=STATE_CART))
+    assert intents
+    assert all(i.risk == RISK_MUTATING_CLICK and i.click_allowed for i in intents)
+
+
 def test_respects_max_intents_cap():
     els = [_el(i, "select", f"Option {i}", f"select#o{i}", aria_label=f"Option {i}") for i in range(40)]
     intents = discover_dynamic_intents(_obs(els), max_intents=10)

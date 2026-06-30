@@ -59,7 +59,7 @@ class GraphGuidedExplorer:
         max_neighbors: int = 5,
         headless: bool = True,
         allow_mutating: bool = True,
-        allow_destructive: bool = False,
+        allow_destructive: bool = True,
         enable_living_graph: bool = False,
         reset_graph: bool = False,
         reset_cart: bool = False,
@@ -113,6 +113,7 @@ class GraphGuidedExplorer:
         self.cart_count_baseline: int | None = None
         self.graph_driven_added = 0
         self.dynamic_discovered = 0
+        self.restores_done = 0
 
     def log(self, kind: str, msg: str) -> None:
         if self.debug:
@@ -169,8 +170,8 @@ class GraphGuidedExplorer:
             safety_notes=[
                 "browser-use executes the actual UI actions using DOM, ARIA labels, screenshots/layout, and page context.",
                 "DFS/graph decides what to explore next; browser-use decides how to perform the narrow action.",
-                "Forbidden final-purchase actions were never clicked.",
-                "Destructive actions are observed only unless --allow-destructive is set.",
+                "Only two things are off-limits: final payment (Buy Now / Place Order / Pay) and navigating to a different product. Everything else — quantity, delete/remove, save-for-later, promo/offers, gift options — is clicked and verified.",
+                "Destructive and mutating cart actions are executed by default, verified by a real cart item-count/subtotal delta, then the cart is auto-restored (re-add) so the flow still completes. Disable with --no-destructive / --no-mutating.",
                 "State gate and replay run before intent execution; cart actions are not searched on checkout pages.",
             ],
             inspect_command=(
@@ -391,13 +392,19 @@ class GraphGuidedExplorer:
             self._event("found", intent.human_label, current_obs.state, "observed_only", intent.source, [intent.canonical_key] + list(intent.success_criteria[:2]))
             return current_obs
 
-        # Cart mutations (quantity changes) cannot be validated from browser-use's
-        # short observe window on the smart-wagon SPA. Snapshot the canonical cart
-        # first so we can prove the change ourselves with a real count/subtotal
-        # delta afterwards — and run the mutation on the canonical cart page.
+        # ANY cart mutation (quantity, delete, save-for-later, promo, gift, ...) is
+        # verified the same authoritative way: snapshot the canonical cart, perform
+        # the action, then re-read the cart and require a real item-count/subtotal
+        # delta. This is genuine testing — not browser-use's flaky in-window guess.
+        # Product-page options (state != cart) are not cart mutations and validate
+        # via the executor's own verdict.
         mutation_pre = None
-        if intent.canonical_key == "action.change_quantity":
-            pre = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart state before quantity change")
+        is_cart_mutation = (
+            current_obs.state == STATE_CART
+            and intent.risk in {RISK_MUTATING_CLICK, RISK_DESTRUCTIVE_CLICK}
+        )
+        if is_cart_mutation:
+            pre = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label=f"Cart before: {intent.human_label}")
             mutation_pre = (_cart_item_count(pre.observation), _cart_subtotal(pre.observation))
 
         # Let browser-use execute the action. Do not rediscover selectors manually.
@@ -406,17 +413,25 @@ class GraphGuidedExplorer:
         status = result.status
         ui_action_taken = result.action_type in {"click", "fill", "select"}
 
-        # Authoritative verification for cart mutations: re-read the canonical cart
-        # and validate on a real item-count / subtotal delta, overriding browser-use's
-        # unreliable in-window verdict (the long-standing Change Quantity problem).
-        if intent.canonical_key == "action.change_quantity" and mutation_pre is not None:
+        if is_cart_mutation and mutation_pre is not None:
             changed, after, ev = await self._verify_cart_mutation(mutation_pre)
             result.evidence = (result.evidence or []) + ev
             status = "validated" if changed else "clicked_observed"
+            post_count = _cart_item_count(after)
+            # A delete/save that empties the cart is a verified pass even if the
+            # subtotal text disappears with the last line.
+            if (mutation_pre[0] or 0) > 0 and post_count == 0:
+                changed, status = True, "validated"
             self._event(
-                "replay", "Verify quantity change", after.state,
+                "replay", f"Verify {intent.human_label}", after.state,
                 "validated" if changed else "not_validated", SOURCE_CRAWLER, ev,
             )
+            # Self-healing: if the active cart is now empty, add the product back so
+            # the destructive/save test does not dead-end the end-to-end flow. The
+            # removal was already proven; this restores state and demonstrates a
+            # complete add -> remove -> verify -> re-add test loop.
+            if changed and post_count == 0:
+                after = await self._restore_product_to_cart()
 
         # Reaching secure checkout is the success criterion for Proceed to Checkout.
         # Some marketplaces (e.g. amazon.in) insert a benign interstitial
@@ -704,6 +719,31 @@ class GraphGuidedExplorer:
         )
         ev = [f"cart_count {pre_count}->{post_count}", f"subtotal {pre_sub}->{post_sub}", f"verified_change={changed}"]
         return changed, post_obs, ev
+
+    async def _restore_product_to_cart(self) -> PageObservation:
+        """Re-add the product after a destructive/save test emptied the cart.
+
+        Removing the item was already verified; re-adding it lets the end-to-end
+        flow still reach checkout and demonstrates a full add -> remove -> verify
+        -> re-add loop. Capped so a failed re-add can never loop forever.
+        """
+        if self.restores_done >= 3:
+            back = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart (restore capped)")
+            return back.observation
+        self.restores_done += 1
+        spec = INTENTS.get("action.add_to_cart")
+        await self.executor.navigate_and_observe(self.product_url, expected_state=STATE_PRODUCT, label="Restore: reopen product to re-add")
+        ni = self.normalizer._from_spec(spec, SOURCE_CRAWLER, None, 0.9, 0.9, 0.0, "restore cart after destructive/save test")
+        ni.expected_state = STATE_PRODUCT
+        res = await self.executor.execute_intent(ni)
+        ok = res.status in {"validated", "clicked_observed", "already_satisfied"}
+        self._event(
+            "replay", "Restore product to cart", res.observation.state,
+            "restored" if ok else res.status, SOURCE_CRAWLER,
+            ["re-added the product after a destructive/save test so checkout can still complete"],
+        )
+        back = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart after restore")
+        return back.observation
 
     def _graph_driven_intents(self, state: str) -> list[NormalizedIntent]:
         """Turn graph-inferred missed scenarios into executable frontier intents.

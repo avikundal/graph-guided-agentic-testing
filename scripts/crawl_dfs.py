@@ -37,7 +37,7 @@ async def run(args):
         max_neighbors=args.max_neighbors,
         headless=not args.headed,
         allow_mutating=not args.no_mutating,
-        allow_destructive=args.allow_destructive,
+        allow_destructive=not args.no_destructive,
         enable_living_graph=args.enable_living_graph,
         reset_graph=args.reset_graph,
         reset_cart=args.reset_cart,
@@ -61,7 +61,7 @@ def main():
     p.add_argument("--headed", action="store_true", help="Show browser window. Default is headless.")
     p.add_argument("--debug", action="store_true")
     p.add_argument("--no-mutating", action="store_true", help="Do not execute mutating clicks like quantity changes/save-for-later.")
-    p.add_argument("--allow-destructive", action="store_true", help="Allow destructive clicks like delete/remove. Default is observe only.")
+    p.add_argument("--no-destructive", action="store_true", help="Do not execute destructive clicks like delete/remove (default: they ARE executed and verified, then the cart is restored).")
     args = p.parse_args()
     asyncio.run(run(args))
 
