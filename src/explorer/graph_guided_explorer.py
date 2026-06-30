@@ -29,6 +29,7 @@ from ..domain.checkout_contract import (
 from ..graph.store import GraphStore
 from ..reporting.report import ExplorationEvent, ExplorationReport, render_report
 from .browser_use_executor import BrowserUseIntentExecutor, BrowserUseResult
+from .dynamic_discovery import discover_dynamic_intents
 from .frontier import IntentFrontier
 from .llm_neighbors import NeighborGenerator
 from .page_observer import PageObservation
@@ -111,6 +112,7 @@ class GraphGuidedExplorer:
         self.cart_url = _cart_url_for(product_url)
         self.cart_count_baseline: int | None = None
         self.graph_driven_added = 0
+        self.dynamic_discovered = 0
 
     def log(self, kind: str, msg: str) -> None:
         if self.debug:
@@ -270,6 +272,7 @@ class GraphGuidedExplorer:
             "graph_scenarios_missed_gaps": missed,
             "graph_scenarios_boundary_safety": scenarios_total - missed,
             "actions_graph_pushed_into_dfs": self.graph_driven_added,
+            "actions_discovered_dynamically": self.dynamic_discovered,
             "graph_pushed_actions_covered": coverage.get("graph_driven_covered", 0),
             "redundant_executions_avoided": redundant_avoided,
             "concept_coverage_pct": coverage.get("observed_pct", 0),
@@ -493,6 +496,14 @@ class GraphGuidedExplorer:
             self._event("observed", f"Observe {obs.state}", obs.state, "observed", source, evidence + state_ev)
 
         crawler_intents = self.normalizer.normalize_observation(obs, source=SOURCE_CRAWLER)
+        # Dynamic, page-driven discovery: whatever actionable controls THIS product
+        # actually exposes — size/colour/variant options, quantity selects,
+        # save-for-later, gift options, etc. — become executable intents too, not
+        # just the fixed catalogue. Risk is classified deterministically and
+        # safety-first, and every one still flows through the same gate/validator.
+        dynamic_intents = discover_dynamic_intents(obs, source=SOURCE_CRAWLER)
+        self.dynamic_discovered += len(dynamic_intents)
+        crawler_intents += dynamic_intents
         added = self.frontier.push_many(crawler_intents)
         for ni in added:
             self.graph.write_intent(self.scope, self.run_id, ni, "frontier_added", [ni.reason])

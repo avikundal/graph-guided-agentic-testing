@@ -129,6 +129,8 @@ def render_report(r: ExplorationReport, *, debug: bool = False) -> str:
                      f"({gi.get('graph_scenarios_missed_gaps', 0)} coverage gaps + {gi.get('graph_scenarios_boundary_safety', 0)} boundary/safety)")
         lines.append(f"  - Actions the graph pushed into exploration:         +{gi.get('actions_graph_pushed_into_dfs', 0)}  "
                      f"(covered by crawler: {gi.get('graph_pushed_actions_covered', 0)})")
+        lines.append(f"  - Actions discovered dynamically from the live page:  +{gi.get('actions_discovered_dynamically', 0)}  "
+                     f"(product options/variants/cart controls, no fixed catalogue)")
         lines.append(f"  - Redundant re-executions the graph memory avoided:  {gi.get('redundant_executions_avoided', 0)}")
         lines.append(f"  - Feature concept coverage:                          {gi.get('concept_coverage_pct', 0)}%")
         lines.append(f"  - Structural gaps the graph flagged:                 {', '.join(gi.get('structural_gaps_flagged', [])) or 'none'}")
