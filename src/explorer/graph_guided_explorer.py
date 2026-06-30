@@ -122,6 +122,7 @@ class GraphGuidedExplorer:
         # Engine 2 (LLM-over-graph) bookkeeping.
         self.crawl_validated_concepts: set[str] = set()
         self.graph_surfaced_scenarios: list[dict] = []
+        self.graph_directed_clicks = 0
 
     def log(self, kind: str, msg: str) -> None:
         if self.debug:
@@ -286,6 +287,7 @@ class GraphGuidedExplorer:
             "actions_graph_pushed_into_dfs": self.graph_driven_added,
             "actions_discovered_dynamically": self.dynamic_discovered,
             "graph_surfaced_missed": [s.get("title", "") for s in self.graph_surfaced_scenarios],
+            "graph_directed_clicks": self.graph_directed_clicks,
             "graph_pushed_actions_covered": coverage.get("graph_driven_covered", 0),
             "redundant_executions_avoided": redundant_avoided,
             "concept_coverage_pct": coverage.get("observed_pct", 0),
@@ -349,7 +351,7 @@ class GraphGuidedExplorer:
                 ),
                 expected_state=STATE_CART, max_steps=12,
             )
-            self._ingest_autonomous(res_probe, STATE_CART)
+            self._ingest_autonomous(res_probe, STATE_CART, source=SOURCE_GRAPH)
             cart3 = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart after graph-probed scenarios")
             cart3_obs = cart3.observation
             if (_cart_item_count(cart3_obs) or 0) == 0:
@@ -372,12 +374,12 @@ class GraphGuidedExplorer:
         self._infer_graph_scenarios()
         self.log("stop", "autonomous exploration complete")
 
-    def _ingest_autonomous(self, res: BrowserUseResult, state: str) -> None:
-        """Ingestion bridge: record what browser-use did BOTH as crawl events and
-        as graph concepts, so the graph can actually reason over the autonomous
-        crawl. Mapping a free-form action label to a canonical concept is
-        deterministic *labeling* (ingestion), not discovery — the crawl already
-        decided what to do; we are only writing down what it touched."""
+    def _ingest_autonomous(self, res: BrowserUseResult, state: str, *, source: str = SOURCE_CRAWLER) -> None:
+        """Ingestion bridge: record what browser-use did BOTH as events and as
+        graph concepts. `source` distinguishes the crawl's own free exploration
+        (SOURCE_CRAWLER) from clicks the GRAPH directed via a feedback probe
+        (SOURCE_GRAPH) — so the graph gets credit for the actions it led."""
+        graph_directed = (source == SOURCE_GRAPH)
         seen: set[str] = set()
         for art in res.artifacts:
             if art.action_type not in {"click", "fill", "select"}:
@@ -392,24 +394,24 @@ class GraphGuidedExplorer:
             if concept:
                 ni = NormalizedIntent(
                     canonical_key=concept, human_label=label[:60], expected_state=act_state,
-                    source=SOURCE_CRAWLER, risk=RISK_MUTATING_CLICK, priority=0.6, confidence=0.9,
+                    source=source, risk=RISK_MUTATING_CLICK, priority=0.6, confidence=0.9,
                 )
-                # Status "validated" => the Concept node is marked observed+validated,
-                # so coverage and the missed-scenario reasoner can see it.
                 self.graph.write_intent(self.scope, self.run_id, ni, "validated", [f"autonomous {art.action_type}"])
                 self.observed_concepts.add(concept)
                 self.crawl_validated_concepts.add(concept)
-                # NOTE: outcome assertions (add_to_cart_validated, checkout reached)
-                # are set by the autonomous loop from REAL state checks, not from a
-                # click label — clicking 'Proceed to checkout' doesn't prove we
-                # reached checkout.
+                if graph_directed:
+                    self.graph_directed_clicks += 1
+            if concept:
+                status = "graph_directed" if graph_directed else "crawl_validated"
+            else:
+                status = "graph_explored" if graph_directed else "crawl_explored"
             self._event(
-                "clicked", (label[:58] or concept or "action"), act_state,
-                "crawl_validated" if concept else "crawl_explored", SOURCE_CRAWLER,
-                [f"autonomous {art.action_type}"] + ([f"concept={concept}"] if concept else []),
+                "clicked", (label[:58] or concept or "action"), act_state, status, source,
+                [("graph-directed probe" if graph_directed else "autonomous") + f" {art.action_type}"]
+                + ([f"concept={concept}"] if concept else []),
             )
         if res.error and "safety_veto" in res.error:
-            self._event("blocked", "Safety veto (deny-list)", state, "vetoed", SOURCE_CRAWLER, [res.error[:120]])
+            self._event("blocked", "Safety veto (deny-list)", state, "vetoed", source, [res.error[:120]])
 
     async def _graph_expansion(self, state: str) -> list[dict]:
         """Engine 2: the graph (via an LLM) reasons about what the crawl missed.

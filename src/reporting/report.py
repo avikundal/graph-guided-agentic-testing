@@ -141,6 +141,8 @@ def render_report(r: ExplorationReport, *, debug: bool = False) -> str:
             lines.append("Engine 2 — scenarios the graph (LLM-over-graph) surfaced as MISSED by the crawl:")
             for t in surfaced[:10]:
                 lines.append(f"  - {t}")
+            lines.append(f"  -> the graph then DIRECTED {gi.get('graph_directed_clicks', 0)} click(s) to probe these "
+                         f"(executed by browser-use, attributed to the graph).")
         lines.append("")
 
     cov = r.coverage or {}
