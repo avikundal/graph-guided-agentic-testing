@@ -9,8 +9,20 @@ from ..domain.checkout_contract import (
     RISK_MUTATING_CLICK,
     RISK_OBSERVE_ONLY,
     STATE_CART,
+    STATE_PRODUCT,
 )
 from .semantic_normalizer import NormalizedIntent
+
+# The action that moves the explorer OUT of a state. Local affordances in a state
+# (product options/variants, cart mutations) are explored first; the exit
+# transition only fires once the local frontier is handled. This is what lets a
+# product's size/colour options run before Add to Cart, and cart actions run
+# before Proceed to Checkout — deep exploration before moving on.
+_EXIT_TRANSITIONS: dict[str, frozenset[str]] = {
+    STATE_PRODUCT: frozenset({"action.add_to_cart", "action.go_to_cart"}),
+    STATE_CART: frozenset({"action.proceed_to_checkout"}),
+}
+_LOCAL_RISKS = {RISK_OBSERVE_ONLY, RISK_MUTATING_CLICK, RISK_DESTRUCTIVE_CLICK}
 
 IntentStatus = Literal["NEW", "EXECUTING", "SUCCESS", "FAILED", "BLOCKED", "SKIPPED"]
 
@@ -163,14 +175,14 @@ class IntentFrontier:
         candidates = [i for i in self.stack if i.expected_state == state and not self.is_completed(i.canonical_key)]
         if not candidates:
             return None
-        # In cart, same-state local exploration must win over the deeper
-        # checkout transition. Proceed to Checkout is selected only when the
-        # remaining cart-local frontier has been handled/blocked/observed.
-        if state == STATE_CART:
+        # Same-state local exploration must win over the exit transition: explore
+        # the product's options before Add to Cart, and the cart's actions before
+        # Proceed to Checkout. The exit fires only once the local frontier is done.
+        exits = _EXIT_TRANSITIONS.get(state, frozenset())
+        if exits:
             local = [
                 i for i in candidates
-                if i.canonical_key != "action.proceed_to_checkout"
-                and i.risk in {RISK_OBSERVE_ONLY, RISK_MUTATING_CLICK, RISK_DESTRUCTIVE_CLICK}
+                if i.canonical_key not in exits and i.risk in _LOCAL_RISKS
             ]
             if local:
                 candidates = local
@@ -223,14 +235,16 @@ class IntentFrontier:
             score -= 0.10
         elif intent.risk == RISK_FORBIDDEN_CLICK:
             score -= 0.35
-        # In cart, keep local exploration before deeper checkout transition.
-        if current_state == STATE_CART and intent.canonical_key == "action.proceed_to_checkout":
+        # Keep local exploration ahead of the exit transition (options before Add
+        # to Cart, cart actions before Proceed to Checkout).
+        exits = _EXIT_TRANSITIONS.get(current_state, frozenset())
+        if intent.canonical_key in exits:
             local_pending = [
                 i for i in self.stack
-                if i.expected_state == STATE_CART
-                and i.canonical_key != "action.proceed_to_checkout"
+                if i.expected_state == current_state
+                and i.canonical_key not in exits
                 and not self.is_completed(i.canonical_key)
-                and i.risk in {RISK_OBSERVE_ONLY, RISK_MUTATING_CLICK, RISK_DESTRUCTIVE_CLICK}
+                and i.risk in _LOCAL_RISKS
             ]
             if local_pending:
                 score -= 1.00
