@@ -348,6 +348,8 @@ class GraphGuidedExplorer:
             self.log("crawl", f"round {crawl_rounds}: concepts={sig[0]} labels={sig[1]} validated={sig[2]} untried={len(untried)} stagnant={stagnant}")
 
         # ---- PHASE B: the graph closes the gaps until it yields nothing new ----
+        # Each surfaced scenario is probed ON THE PAGE IT BELONGS TO: the concept
+        # implies its state (contract), so we navigate there before probing.
         graph_rounds = 0
         while graph_rounds < self._GRAPH_MAX_ROUNDS:
             graph_rounds += 1
@@ -356,17 +358,7 @@ class GraphGuidedExplorer:
             if not missed:
                 break
             before = len(self.observed_concepts)
-            probes = "; ".join(m["probe"] for m in missed[:4])
-            surfaced_concepts = {m["concept"] for m in missed if m.get("concept")}
-            res_probe = await self.executor.explore_autonomously(
-                goal=(
-                    "A testing knowledge-graph believes the following scenarios were "
-                    f"likely MISSED. Try each one on the current cart: {probes}"
-                ),
-                expected_state=STATE_CART, max_steps=12,
-            )
-            self._ingest_autonomous(res_probe, STATE_CART, source=SOURCE_GRAPH, graph_concepts=surfaced_concepts)
-            await self._reobserve_cart_restore()
+            await self._run_graph_probes(missed)
             self.log("graph", f"gap-closing round {graph_rounds}: surfaced {len(missed)}, concepts now {len(self.observed_concepts)}")
             if len(self.observed_concepts) == before:
                 break  # the graph's probes revealed nothing new -> converged
@@ -520,6 +512,50 @@ class GraphGuidedExplorer:
         if proposals:
             self.log("graph", f"Engine 2 surfaced {len(proposals)} missed scenario(s) the crawl skipped")
         return proposals
+
+    def _state_for_concept(self, concept: str) -> str:
+        """The page a concept lives on — so the graph's probe can be run on the
+        RIGHT page. Derived from the contract (concept -> expected state)."""
+        spec = INTENTS.get(concept)
+        if spec and getattr(spec, "expected_states", None):
+            return spec.expected_states[0]
+        if concept == "action.add_to_cart":
+            return STATE_PRODUCT
+        if concept in ("domain.checkout_boundary", "domain.final_order_boundary"):
+            return STATE_CHECKOUT
+        return STATE_CART
+
+    async def _run_graph_probes(self, missed: list[dict]) -> None:
+        """Probe each graph-surfaced scenario ON THE PAGE IT BELONGS TO: group by
+        target state, navigate there, then let browser-use try them. The crawler's
+        hands, on the page the graph chose."""
+        from collections import defaultdict
+        by_state: dict[str, list[dict]] = defaultdict(list)
+        for m in missed:
+            by_state[self._state_for_concept(m.get("concept") or "")].append(m)
+
+        for st, items in by_state.items():
+            # The checkout boundary is observe-only — never probe-click near payment.
+            if st == STATE_CHECKOUT:
+                continue
+            if st == STATE_PRODUCT:
+                await self.executor.navigate_and_observe(self.product_url, expected_state=STATE_PRODUCT, label="Graph -> product page for probe")
+                probe_state = STATE_PRODUCT
+            else:
+                await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Graph -> cart for probe")
+                probe_state = STATE_CART
+            probes = "; ".join(m["probe"] for m in items[:4])
+            surfaced_concepts = {m["concept"] for m in items if m.get("concept")}
+            self.log("graph", f"probing {len(items)} graph scenario(s) on {st}")
+            res = await self.executor.explore_autonomously(
+                goal=(
+                    "A testing knowledge-graph believes these scenarios were MISSED on THIS page. "
+                    f"Try each one here: {probes}"
+                ),
+                expected_state=probe_state, max_steps=10,
+            )
+            self._ingest_autonomous(res, probe_state, source=SOURCE_GRAPH, graph_concepts=surfaced_concepts)
+            await self._reobserve_cart_restore()
 
     async def _dfs_loop(self, current_obs: PageObservation) -> None:
         for _ in range(self.max_steps):
