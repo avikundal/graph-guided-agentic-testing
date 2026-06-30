@@ -344,6 +344,7 @@ class GraphGuidedExplorer:
         missed = await self._graph_expansion(STATE_CART)
         if missed:
             probes = "; ".join(m["probe"] for m in missed[:4])
+            surfaced_concepts = {m["concept"] for m in missed if m.get("concept")}
             res_probe = await self.executor.explore_autonomously(
                 goal=(
                     "A testing knowledge-graph believes the following scenarios were "
@@ -351,7 +352,7 @@ class GraphGuidedExplorer:
                 ),
                 expected_state=STATE_CART, max_steps=12,
             )
-            self._ingest_autonomous(res_probe, STATE_CART, source=SOURCE_GRAPH)
+            self._ingest_autonomous(res_probe, STATE_CART, source=SOURCE_GRAPH, graph_concepts=surfaced_concepts)
             cart3 = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart after graph-probed scenarios")
             cart3_obs = cart3.observation
             if (_cart_item_count(cart3_obs) or 0) == 0:
@@ -374,12 +375,18 @@ class GraphGuidedExplorer:
         self._infer_graph_scenarios()
         self.log("stop", "autonomous exploration complete")
 
-    def _ingest_autonomous(self, res: BrowserUseResult, state: str, *, source: str = SOURCE_CRAWLER) -> None:
+    def _ingest_autonomous(self, res: BrowserUseResult, state: str, *, source: str = SOURCE_CRAWLER,
+                           graph_concepts: set[str] | None = None) -> None:
         """Ingestion bridge: record what browser-use did BOTH as events and as
-        graph concepts. `source` distinguishes the crawl's own free exploration
-        (SOURCE_CRAWLER) from clicks the GRAPH directed via a feedback probe
-        (SOURCE_GRAPH) — so the graph gets credit for the actions it led."""
-        graph_directed = (source == SOURCE_GRAPH)
+        graph concepts.
+
+        Attribution is per-click and strict: a click is credited to the GRAPH
+        only when it runs during a graph-directed probe AND fulfills a concept the
+        graph actually surfaced (`graph_concepts`). Anything browser-use wanders
+        into on its own — even during a graph probe — stays the crawler's, so
+        browser-use's discoveries are never logged as graph-found."""
+        graph_concepts = graph_concepts or set()
+        probe = (source == SOURCE_GRAPH)
         seen: set[str] = set()
         for art in res.artifacts:
             if art.action_type not in {"click", "fill", "select"}:
@@ -391,23 +398,22 @@ class GraphGuidedExplorer:
             seen.add(key)
             concept = _action_to_concept(label)
             act_state = art.state or state
+            is_graph = probe and concept is not None and concept in graph_concepts
+            eff_source = SOURCE_GRAPH if is_graph else SOURCE_CRAWLER
             if concept:
                 ni = NormalizedIntent(
                     canonical_key=concept, human_label=label[:60], expected_state=act_state,
-                    source=source, risk=RISK_MUTATING_CLICK, priority=0.6, confidence=0.9,
+                    source=eff_source, risk=RISK_MUTATING_CLICK, priority=0.6, confidence=0.9,
                 )
                 self.graph.write_intent(self.scope, self.run_id, ni, "validated", [f"autonomous {art.action_type}"])
                 self.observed_concepts.add(concept)
                 self.crawl_validated_concepts.add(concept)
-                if graph_directed:
+                if is_graph:
                     self.graph_directed_clicks += 1
-            if concept:
-                status = "graph_directed" if graph_directed else "crawl_validated"
-            else:
-                status = "graph_explored" if graph_directed else "crawl_explored"
+            status = "graph_directed" if is_graph else ("crawl_validated" if concept else "crawl_explored")
             self._event(
-                "clicked", (label[:58] or concept or "action"), act_state, status, source,
-                [("graph-directed probe" if graph_directed else "autonomous") + f" {art.action_type}"]
+                "clicked", (label[:58] or concept or "action"), act_state, status, eff_source,
+                [("graph-directed probe" if is_graph else "autonomous") + f" {art.action_type}"]
                 + ([f"concept={concept}"] if concept else []),
             )
         if res.error and "safety_veto" in res.error:
