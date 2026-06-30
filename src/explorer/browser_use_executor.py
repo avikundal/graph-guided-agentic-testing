@@ -436,7 +436,7 @@ Do NOT click again if redirected to sign-in or another page.
         # acted on — not browser-use's verbose page summary. This keeps the report
         # legible AND makes the veto precise: a done() summary that merely mentions
         # "Buy now" must not trigger a false payment veto.
-        el_label = _element_label_for_action(action, obs) if action is not None else ""
+        el_label = _element_label_for_action(action, browser_state) if action is not None else ""
         target = el_label or (_action_target_label(action) if action is not None else self._current_task)
         selector = _resolve_selector(action, browser_state) if action is not None else ""
 
@@ -803,10 +803,10 @@ def _action_target_label(action: Any) -> str:
     return type(action).__name__
 
 
-def _element_label_for_action(action: Any, obs: Any) -> str:
-    """Resolve the human label (text/aria) of the element an action targets, by
-    matching the action's element index against the observed elements. Returns ""
-    for fills/navigations (no element index) so the caller can fall back."""
+def _element_label_for_action(action: Any, browser_state: Any) -> str:
+    """Resolve the human label of the element an action targets, using
+    browser-use's OWN DOM selector map (its indices), so the index matches what
+    the action references. Returns "" for fills/navigations (no element index)."""
     if action is None or not hasattr(action, "model_dump"):
         return ""
     try:
@@ -816,16 +816,39 @@ def _element_label_for_action(action: Any, obs: Any) -> str:
     idx = flat.get("index")
     if idx in (None, ""):
         return ""
+    return _label_from_dom(browser_state, idx)
+
+
+def _label_from_dom(browser_state: Any, index: Any) -> str:
+    """Human label of the element at browser-use's element index, from its DOM."""
     try:
-        idx = int(idx)
+        idx = int(index)
     except Exception:
         return ""
-    for el in getattr(obs, "elements", None) or []:
-        if getattr(el, "index", None) == idx:
-            lbl = (getattr(el, "aria_label", "") or getattr(el, "text", "")
-                   or getattr(el, "value", "") or getattr(el, "name", "") or "")
-            return " ".join(lbl.split())[:60]
-    return ""
+    try:
+        dom_state = getattr(browser_state, "dom_state", None)
+        selector_map = getattr(dom_state, "selector_map", None) or {}
+        node = selector_map.get(idx) if hasattr(selector_map, "get") else None
+        if not node:
+            return ""
+        attrs = getattr(node, "attributes", None) or {}
+        txt = ""
+        for meth in ("get_meaningful_text_for_llm", "get_all_children_text", "get_all_text_till_next_clickable_element"):
+            fn = getattr(node, meth, None)
+            if callable(fn):
+                try:
+                    txt = fn() or ""
+                except Exception:
+                    txt = ""
+                if txt:
+                    break
+        if not txt:
+            txt = getattr(node, "text", "") or ""
+        label = (attrs.get("aria-label") or txt or attrs.get("value")
+                 or attrs.get("placeholder") or attrs.get("name") or attrs.get("id") or "")
+        return " ".join(str(label).split())[:60]
+    except Exception:
+        return ""
 
 
 def _resolve_selector(action: Any, browser_state: Any) -> str:

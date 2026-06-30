@@ -372,14 +372,10 @@ class GraphGuidedExplorer:
                 # so coverage and the missed-scenario reasoner can see it.
                 self.graph.write_intent(self.scope, self.run_id, ni, "validated", [f"autonomous {art.action_type}"])
                 self.observed_concepts.add(concept)
-                if concept == "action.add_to_cart":
-                    self.add_to_cart_validated = True
-                    self.cart_provenance = "cart_confirmation_or_cart_delta_verified"
-                    self.observed_concepts.add("domain.cart_item")
-                elif concept == "action.proceed_to_checkout":
-                    self.proceed_to_checkout_validated = True
-                    self.checkout_reached = True
-                    self.observed_concepts.add("domain.checkout_boundary")
+                # NOTE: outcome assertions (add_to_cart_validated, checkout reached)
+                # are set by the autonomous loop from REAL state checks, not from a
+                # click label — clicking 'Proceed to checkout' doesn't prove we
+                # reached checkout.
             self._event(
                 "clicked", (label[:58] or concept or "action"), act_state,
                 "crawl_validated" if concept else "crawl_explored", SOURCE_CRAWLER,
