@@ -493,6 +493,13 @@ class GraphGuidedExplorer:
         else:
             kind = "blocked"
         self._event(kind, intent.human_label, current_obs.state, status, intent.source, result.evidence[:5] + ([f"next_state={after.state}"] if after.state else []))
+        # After Add to Cart, open the full canonical cart right away so its controls
+        # (quantity, delete, save-for-later, promo) are discovered and queued BEFORE
+        # Proceed to Checkout is considered. The add-to-cart interstitial is sparse,
+        # which previously hid those controls and let checkout fire too early.
+        if intent.canonical_key == "action.add_to_cart" and status == "validated" and after.state != STATE_CART:
+            cart_nav = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Open full cart after add")
+            after = cart_nav.observation
         obs = await self._observe_update_frontier(after, source=SOURCE_CRAWLER)
         return obs
 
