@@ -326,13 +326,13 @@ class GraphGuidedExplorer:
         # Many distinct controls collapse onto one concept (increase vs decrease
         # quantity, save-then-restore, invalid coupon, remove the last item), so
         # concept-count alone would stop while real controls sit untried.
-        last_cart = current_obs
+        last_obs = current_obs
         stagnant = 0
         prev_sig = None
         crawl_rounds = 0
         while crawl_rounds < self._CRAWL_MAX_ROUNDS and stagnant < 2:
             crawl_rounds += 1
-            untried = self._untried_visible_labels(last_cart)
+            untried = self._untried_visible_labels(last_obs)
             hint = (" Controls you have NOT tried yet include: " + "; ".join(sorted(untried)[:6]) + ".") if untried else ""
             res = await self.executor.explore_autonomously(
                 goal=("Test this shopping cart thoroughly. Try EVERY distinct control you have not "
@@ -340,8 +340,11 @@ class GraphGuidedExplorer:
                       "remove/delete, apply a coupon (try an invalid one too), gift options." + hint),
                 expected_state=STATE_CART, max_steps=12,
             )
-            self._ingest_autonomous(res, STATE_CART)
-            last_cart = await self._reobserve_cart_restore()
+            # The agent navigates as it wants — we do NOT pull it back to the cart.
+            # Just ingest wherever it ended (actions + that page's concepts).
+            self._ingest_autonomous(res, res.observation.state or STATE_CART)
+            await self._ingest_observation(res.observation, source=SOURCE_CRAWLER)
+            last_obs = res.observation
             sig = (len(self.observed_concepts), len(self.clicked_labels), len(self.crawl_validated_concepts))
             stagnant = stagnant + 1 if sig == prev_sig else 0
             prev_sig = sig
@@ -364,11 +367,10 @@ class GraphGuidedExplorer:
                 break  # the graph's probes revealed nothing new -> converged
 
         # ---- PHASE C: proceed to the checkout boundary (veto prevents ordering) ----
-        # Start from a clean, freshly-observed cart so the burst isn't mid-wander.
-        await self._reobserve_cart_restore()
+        # The agent navigates itself — we don't force it back to the cart.
         res3 = await self.executor.explore_autonomously(
-            goal="You are on the shopping cart. Click ONLY the 'Proceed to Checkout' button to reach the secure checkout page. Do not click anything else. Do NOT place an order or pay — stop as soon as the checkout page appears.",
-            expected_state=STATE_CART, max_steps=3,
+            goal="Go to your shopping cart and click the 'Proceed to Checkout' button to reach the secure checkout page. Do NOT place an order or pay — stop as soon as the checkout page appears.",
+            expected_state=STATE_CART, max_steps=4,
         )
         self._ingest_autonomous(res3, STATE_CHECKOUT)
         final_obs = res3.observation
@@ -421,16 +423,6 @@ class GraphGuidedExplorer:
                 continue
             out.add(low)
         return out
-
-    async def _reobserve_cart_restore(self) -> PageObservation:
-        """Re-read the canonical cart between rounds; restore the product if a
-        destructive/save action emptied it, then ingest the observation."""
-        cart = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart re-observe")
-        obs = cart.observation
-        if (_cart_item_count(obs) or 0) == 0:
-            obs = await self._restore_product_to_cart()
-        await self._ingest_observation(obs, source=SOURCE_CRAWLER)
-        return obs
 
     def _ingest_autonomous(self, res: BrowserUseResult, state: str, *, source: str = SOURCE_CRAWLER,
                            graph_concepts: set[str] | None = None) -> None:
@@ -555,7 +547,9 @@ class GraphGuidedExplorer:
                 expected_state=probe_state, max_steps=10,
             )
             self._ingest_autonomous(res, probe_state, source=SOURCE_GRAPH, graph_concepts=surfaced_concepts)
-            await self._reobserve_cart_restore()
+            # The graph chose the page and we navigated there; after the probe we
+            # just ingest wherever the agent ended — no forced return.
+            await self._ingest_observation(res.observation, source=SOURCE_CRAWLER)
 
     async def _dfs_loop(self, current_obs: PageObservation) -> None:
         for _ in range(self.max_steps):
