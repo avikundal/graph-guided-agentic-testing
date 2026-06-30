@@ -94,6 +94,22 @@ def test_promo_input_is_observe_only_not_blind_filled():
 
 
 def test_respects_max_intents_cap():
-    els = [_el(i, "select", f"Option {i}", f"select#o{i}") for i in range(40)]
+    els = [_el(i, "select", f"Option {i}", f"select#o{i}", aria_label=f"Option {i}") for i in range(40)]
     intents = discover_dynamic_intents(_obs(els), max_intents=10)
     assert len(intents) == 10
+
+
+def test_skips_internal_widget_scaffolding():
+    # The real Amazon "twister" widget noise that flooded an earlier run: live
+    # region announcers and internal ids must NOT become discovered actions.
+    els = [
+        _el(1, "a", "a-autoid-49-announce", "a#a-autoid-49-announce", aria_label="a-autoid-49-announce"),
+        _el(2, "span", "inline-twister-dim-title-color_name", "span#inline-twister"),
+        _el(3, "div", "color_name_0", "div#color_name_0"),
+        _el(4, "button", "0", "button#opt0"),                       # stray glyph, no real label
+        _el(5, "input", "Coral", "input#swatch", type="radio", role="radio", aria_label="Coral"),  # the real one
+    ]
+    labels = _by_label(discover_dynamic_intents(_obs(els)))
+    assert "coral" in labels                       # the genuine colour option survives
+    assert all("autoid" not in l and "twister" not in l and "color_name" not in l for l in labels)
+    assert "0" not in labels

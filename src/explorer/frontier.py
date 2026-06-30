@@ -23,6 +23,11 @@ _EXIT_TRANSITIONS: dict[str, frozenset[str]] = {
     STATE_CART: frozenset({"action.proceed_to_checkout"}),
 }
 _LOCAL_RISKS = {RISK_OBSERVE_ONLY, RISK_MUTATING_CLICK, RISK_DESTRUCTIVE_CLICK}
+# Explore at most this many local actions in a state before the exit transition
+# is allowed to fire anyway. Guarantees the core flow (Add to Cart -> Proceed to
+# Checkout) always completes even on a product with many variant controls,
+# instead of the step budget being spent entirely on options.
+_LOCAL_EXPLORE_CAP = 8
 
 IntentStatus = Literal["NEW", "EXECUTING", "SUCCESS", "FAILED", "BLOCKED", "SKIPPED"]
 
@@ -87,6 +92,7 @@ class IntentFrontier:
     blocked_identities: set[str] = field(default_factory=set)
     memory: dict[str, IntentMemoryRecord] = field(default_factory=dict)
     canonical_success: dict[str, IntentMemoryRecord] = field(default_factory=dict)
+    local_attempts: dict[str, int] = field(default_factory=dict)
     stats: FrontierStats = field(default_factory=FrontierStats)
 
     def push_many(self, intents: list[NormalizedIntent]) -> list[NormalizedIntent]:
@@ -188,6 +194,10 @@ class IntentFrontier:
                 candidates = local
         candidates.sort(key=lambda i: self._score_for_state(i, state), reverse=True)
         chosen = candidates[0]
+        # Count local (non-exit) attempts so the exit transition is eventually
+        # allowed even if many options remain — keeps the core flow progressing.
+        if chosen.canonical_key not in _EXIT_TRANSITIONS.get(state, frozenset()) and chosen.risk in _LOCAL_RISKS:
+            self.local_attempts[state] = self.local_attempts.get(state, 0) + 1
         self.stack.remove(chosen)
         self.mark_executing(chosen)
         self.stats.popped += 1
@@ -238,7 +248,7 @@ class IntentFrontier:
         # Keep local exploration ahead of the exit transition (options before Add
         # to Cart, cart actions before Proceed to Checkout).
         exits = _EXIT_TRANSITIONS.get(current_state, frozenset())
-        if intent.canonical_key in exits:
+        if intent.canonical_key in exits and self.local_attempts.get(current_state, 0) < _LOCAL_EXPLORE_CAP:
             local_pending = [
                 i for i in self.stack
                 if i.expected_state == current_state

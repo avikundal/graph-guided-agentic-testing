@@ -77,11 +77,39 @@ def _slug(text: str) -> str:
     return s[:40] or "control"
 
 
+# Tokens that mark a string as an internal DOM identifier / widget scaffolding
+# rather than a human-meaningful control label. Amazon's variant ("twister")
+# widgets expose dozens of these (a-autoid-N-announce, inline-twister-*,
+# color_name_0) — they are NOT separate tests and must not be discovered.
+_NOISE_TOKENS = (
+    "autoid", "announce", "twister", "sprite", "a-button-inner", "a-popover",
+    "a-declarative", "dim-title", "expanded-dimension", "_name_", "data-csa",
+    "a-offscreen", "a-hidden",
+)
+
+
+def _looks_like_internal_id(label: str) -> bool:
+    """True when a label is DOM scaffolding, not something a user would read."""
+    low = label.lower()
+    if any(tok in low for tok in _NOISE_TOKENS):
+        return True
+    # Must contain at least one letter and be more than a stray digit/glyph.
+    if len(label.strip()) < 2 or not re.search(r"[a-zA-Z]", label):
+        return True
+    # A hyphen/underscore slug with no spaces (e.g. "color_name_0",
+    # "inline-twister-dim") is an id, not a label. Real labels read as words.
+    if " " not in label and re.fullmatch(r"[a-z0-9]+([-_][a-z0-9]+)+", low):
+        return True
+    return False
+
+
 def _label_for(el: UIElement) -> str:
-    for cand in (el.aria_label, el.text, el.value, el.name, el.title if hasattr(el, "title") else None):
-        c = (cand or "").strip()
-        if c and not c.startswith("<"):
-            return re.sub(r"\s+", " ", c)[:60]
+    # Prefer human-readable accessible text; skip any candidate that is actually
+    # an internal identifier. id/name are deliberately NOT used as labels.
+    for cand in (el.aria_label, el.text, el.value):
+        c = re.sub(r"\s+", " ", (cand or "").strip())
+        if c and not c.startswith("<") and not _looks_like_internal_id(c):
+            return c[:60]
     return ""
 
 
@@ -147,7 +175,7 @@ def discover_dynamic_intents(
     obs: PageObservation,
     *,
     source: str = SOURCE_CRAWLER,
-    max_intents: int = 14,
+    max_intents: int = 10,
 ) -> list[NormalizedIntent]:
     """Turn the actually-present interactable controls into executable intents.
 
