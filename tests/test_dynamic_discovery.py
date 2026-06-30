@@ -145,3 +145,15 @@ def test_skips_internal_widget_scaffolding():
     assert "coral" in labels                       # the genuine colour option survives
     assert all("autoid" not in l and "twister" not in l and "color_name" not in l for l in labels)
     assert "0" not in labels
+
+
+def test_action_label_maps_to_concept_for_ingestion():
+    # The ingestion bridge: free-form labels the autonomous crawl clicked map to
+    # canonical concepts so the graph can reason over what was done.
+    from src.explorer.graph_guided_explorer import _action_to_concept
+    assert _action_to_concept("Delete Allen Solly Polo Shirt") == "action.delete_item"
+    assert _action_to_concept("Increase quantity by one MASALA POTLI") == "action.change_quantity"
+    assert _action_to_concept("Save for later") == "action.save_for_later"
+    assert _action_to_concept("Proceed to checkout") == "action.proceed_to_checkout"
+    assert _action_to_concept("Apply coupon") == "capability.promo_code"
+    assert _action_to_concept("Some unrelated label") is None

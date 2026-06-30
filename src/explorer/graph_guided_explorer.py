@@ -347,19 +347,44 @@ class GraphGuidedExplorer:
         self.log("stop", "autonomous exploration complete")
 
     def _ingest_autonomous(self, res: BrowserUseResult, state: str) -> None:
-        """Record the actions browser-use chose on its own as crawl-discovered
-        scenarios (attributed to the crawl), plus any safety veto."""
+        """Ingestion bridge: record what browser-use did BOTH as crawl events and
+        as graph concepts, so the graph can actually reason over the autonomous
+        crawl. Mapping a free-form action label to a canonical concept is
+        deterministic *labeling* (ingestion), not discovery — the crawl already
+        decided what to do; we are only writing down what it touched."""
         seen: set[str] = set()
         for art in res.artifacts:
             if art.action_type not in {"click", "fill", "select"}:
                 continue
-            label = (art.target_label or "").strip()
+            label = html.unescape(html.unescape((art.target_label or "").strip()))
             key = label.lower()
             if not label or key in seen:
                 continue
             seen.add(key)
-            self._event("clicked", label[:60], state, "crawl_explored", SOURCE_CRAWLER,
-                        [f"autonomous {art.action_type}", f"state={art.state}"])
+            concept = _action_to_concept(label)
+            act_state = art.state or state
+            if concept:
+                ni = NormalizedIntent(
+                    canonical_key=concept, human_label=label[:60], expected_state=act_state,
+                    source=SOURCE_CRAWLER, risk=RISK_MUTATING_CLICK, priority=0.6, confidence=0.9,
+                )
+                # Status "validated" => the Concept node is marked observed+validated,
+                # so coverage and the missed-scenario reasoner can see it.
+                self.graph.write_intent(self.scope, self.run_id, ni, "validated", [f"autonomous {art.action_type}"])
+                self.observed_concepts.add(concept)
+                if concept == "action.add_to_cart":
+                    self.add_to_cart_validated = True
+                    self.cart_provenance = "cart_confirmation_or_cart_delta_verified"
+                    self.observed_concepts.add("domain.cart_item")
+                elif concept == "action.proceed_to_checkout":
+                    self.proceed_to_checkout_validated = True
+                    self.checkout_reached = True
+                    self.observed_concepts.add("domain.checkout_boundary")
+            self._event(
+                "clicked", (label[:58] or concept or "action"), act_state,
+                "crawl_validated" if concept else "crawl_explored", SOURCE_CRAWLER,
+                [f"autonomous {art.action_type}"] + ([f"concept={concept}"] if concept else []),
+            )
         if res.error and "safety_veto" in res.error:
             self._event("blocked", "Safety veto (deny-list)", state, "vetoed", SOURCE_CRAWLER, [res.error[:120]])
 
@@ -964,6 +989,41 @@ def _asin_from_url(url: str) -> str:
     """Extract the Amazon ASIN (stable product id) from a product URL."""
     m = re.search(r"/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})", url or "")
     return m.group(1) if m else ""
+
+
+# Ingestion-only labeling: map a free-form action label that the autonomous crawl
+# clicked into a canonical feature concept, so the graph can reason over what was
+# done. This is deterministic *labeling* (ingestion), not catalogue-driven
+# discovery — the crawl already chose the action; we only record what it touched.
+_ACTION_CONCEPT_MAP = (
+    ("save for later", "action.save_for_later"),
+    ("add to list", "action.save_for_later"),
+    ("add to wish", "action.save_for_later"),
+    ("move to cart", "action.move_to_cart"),
+    ("decrease quantity", "action.change_quantity"),
+    ("increase quantity", "action.change_quantity"),
+    ("change quantity", "action.change_quantity"),
+    ("quantity", "action.change_quantity"),
+    ("delete", "action.delete_item"),
+    ("remove", "action.delete_item"),
+    ("proceed to checkout", "action.proceed_to_checkout"),
+    ("proceed to buy", "action.proceed_to_checkout"),
+    ("checkout", "action.proceed_to_checkout"),
+    ("add to cart", "action.add_to_cart"),
+    ("addtocart", "action.add_to_cart"),
+    ("coupon", "capability.promo_code"),
+    ("promo", "capability.promo_code"),
+    ("offer", "capability.promo_code"),
+    ("gift", "capability.promo_code"),
+)
+
+
+def _action_to_concept(label: str) -> str | None:
+    low = (label or "").lower()
+    for kw, concept in _ACTION_CONCEPT_MAP:
+        if kw in low:
+            return concept
+    return None
 
 
 def _checkout_reached_ok(after_state: str, after_url: str, error: str) -> bool:
