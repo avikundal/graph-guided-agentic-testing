@@ -387,6 +387,9 @@ class GraphGuidedExplorer:
             if (_cart_item_count(obs) or 0) > 0:
                 self.add_to_cart_validated = True
         await self._ingest_observation(obs, source=SOURCE_CRAWLER)
+        # Now the cart-line title is known — give the hard veto its brand tokens
+        # (the product-page title was often empty).
+        self.executor.set_product_title(self.product_title or self.cart_title)
         return obs
 
     async def _reobserve_cart_restore(self) -> PageObservation:
@@ -411,7 +414,10 @@ class GraphGuidedExplorer:
         browser-use's discoveries are never logged as graph-found."""
         graph_concepts = graph_concepts or set()
         probe = (source == SOURCE_GRAPH)
-        title_tokens = product_tokens(self.product_title)
+        # Brand tokens of the item under test. product_title (from the product
+        # page) is often empty because the initial observe is a summary, so fall
+        # back to cart_title, read reliably from OUR ASIN's cart line.
+        title_tokens = product_tokens(self.product_title or self.cart_title)
         seen: set[str] = set()
         for art in res.artifacts:
             if art.action_type not in {"click", "fill", "select"}:
