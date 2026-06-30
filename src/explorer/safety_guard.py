@@ -52,6 +52,35 @@ _NAV_ACTIONS = {"navigate", "go_to_url", "open_tab", "new_tab"}
 _ASIN_RE = re.compile(r"/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})", re.I)
 _HOST_RE = re.compile(r"^https?://([^/]+)", re.I)
 
+# Cart/action words stripped before comparing a label's PRODUCT tokens, so we
+# compare the product name, not the action verb.
+_LABEL_STOPWORDS = {
+    "quantity", "increase", "decrease", "delete", "remove", "save", "later", "move",
+    "cart", "item", "items", "list", "wish", "gift", "updating", "update", "added",
+    "proceed", "checkout", "change", "button", "option", "options", "price", "total",
+    "subtotal", "stock", "this", "that", "with", "from", "your", "into", "back", "shopping",
+}
+
+
+def product_tokens(title: str) -> frozenset:
+    """The BRAND tokens of the item under test — the first couple of significant
+    words, which distinguish one product from another (two polos share 'polo' but
+    not the brand). Used to tell the item under test from a recommendation."""
+    sig = [t for t in re.findall(r"[a-z]{4,}", (title or "").lower()) if t not in _LABEL_STOPWORDS]
+    return frozenset(sig[:2])
+
+
+def is_other_product_label(label: str, brand_tokens) -> bool:
+    """True if a cart-line action label clearly names a DIFFERENT product than the
+    one under test (a recommendation/cross-sell the agent wandered onto): it carries
+    a product name but shares none of the item-under-test's brand tokens."""
+    if not brand_tokens or len(label) < 25:
+        return False
+    toks = {t for t in re.findall(r"[a-z]{4,}", label.lower())} - _LABEL_STOPWORDS
+    if len(toks) < 2:  # not enough product-name content to judge
+        return False
+    return not (toks & set(brand_tokens))
+
 
 def asin_from_url(url: str) -> str:
     m = _ASIN_RE.search(url or "")
@@ -70,6 +99,7 @@ def veto_reason(
     action_type: str,
     product_asin: str,
     base_host: str,
+    product_title_tokens=frozenset(),
 ) -> str | None:
     """Return a short reason string if this action must be blocked, else None."""
     text = (target_label or "").lower()
@@ -85,9 +115,13 @@ def veto_reason(
     if any(t in text for t in _SESSION_TERMS):
         return f"session:{text[:30]}"
 
-    # 2) Off-product navigation (only checkable for navigation-style actions;
-    #    click-driven cross-product moves are handled by the prompt + post-hoc
-    #    state recovery).
+    # 2a) Off-product CART action — the agent wandered onto a recommendation /
+    #     cross-sell for a DIFFERENT product. Blocking this is the user's own
+    #     boundary ("only the product under test").
+    if action_type in {"click", "select"} and is_other_product_label(text, product_title_tokens):
+        return "off_product:other_item"
+
+    # 2) Off-product navigation (navigation-style actions whose URL we can read).
     if action_type in _NAV_ACTIONS and url.startswith("http"):
         host = host_of(url)
         if base_host and host and host != base_host:

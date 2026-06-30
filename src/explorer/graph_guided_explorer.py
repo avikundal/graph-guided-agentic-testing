@@ -31,6 +31,7 @@ from ..reporting.report import ExplorationEvent, ExplorationReport, render_repor
 from .browser_use_executor import BrowserUseIntentExecutor, BrowserUseResult
 from .dynamic_discovery import discover_dynamic_intents
 from .graph_expansion import expand_from_graph
+from .safety_guard import is_other_product_label, product_tokens
 from .frontier import IntentFrontier
 from .llm_neighbors import NeighborGenerator
 from .page_observer import PageObservation
@@ -161,6 +162,9 @@ class GraphGuidedExplorer:
             )
             self._record_replay_like(initial, "Initial product page", STATE_PRODUCT)
             current_obs = await self._observe_update_frontier(initial.observation, source=SOURCE_CRAWLER)
+            # Now the product title is known — let the veto also block cart actions
+            # on a DIFFERENT product (recommendations/cross-sells).
+            self.executor.set_product_title(self.product_title)
             if self.autonomous:
                 await self._autonomous_loop(current_obs)
             else:
@@ -351,9 +355,11 @@ class GraphGuidedExplorer:
                 break  # the graph's probes revealed nothing new -> converged
 
         # ---- PHASE C: proceed to the checkout boundary (veto prevents ordering) ----
+        # Start from a clean, freshly-observed cart so the burst isn't mid-wander.
+        await self._reobserve_cart_restore()
         res3 = await self.executor.explore_autonomously(
-            goal="Click 'Proceed to Checkout' to reach the secure checkout page. Do NOT place an order or pay — stop as soon as the checkout page appears.",
-            expected_state=STATE_CART, max_steps=4,
+            goal="You are on the shopping cart. Click ONLY the 'Proceed to Checkout' button to reach the secure checkout page. Do not click anything else. Do NOT place an order or pay — stop as soon as the checkout page appears.",
+            expected_state=STATE_CART, max_steps=3,
         )
         self._ingest_autonomous(res3, STATE_CHECKOUT)
         final_obs = res3.observation
@@ -405,6 +411,7 @@ class GraphGuidedExplorer:
         browser-use's discoveries are never logged as graph-found."""
         graph_concepts = graph_concepts or set()
         probe = (source == SOURCE_GRAPH)
+        title_tokens = product_tokens(self.product_title)
         seen: set[str] = set()
         for art in res.artifacts:
             if art.action_type not in {"click", "fill", "select"}:
@@ -414,6 +421,10 @@ class GraphGuidedExplorer:
             if not label or key in seen:
                 continue
             seen.add(key)
+            # Safety net: never record an action on a DIFFERENT product, even if it
+            # slipped past the veto — keeps the graph scoped to the item under test.
+            if is_other_product_label(label, title_tokens):
+                continue
             concept = _action_to_concept(label)
             act_state = art.state or state
             is_graph = probe and concept is not None and concept in graph_concepts

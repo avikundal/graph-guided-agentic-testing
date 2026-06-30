@@ -83,3 +83,16 @@ def test_blocks_session_destroying_actions():
     assert _veto(target="Sign out")
     assert _veto(target="Switch accounts")
     assert _veto(target="Add to cart") is None   # still allowed
+
+
+def test_blocks_cart_action_on_a_different_product():
+    from src.explorer.safety_guard import product_tokens, is_other_product_label
+    tt = product_tokens("Allen Solly Men's Casual Polo Shirt")
+    # wrong product (recommendation/cross-sell) -> blocked
+    assert is_other_product_label("Delete URBAN FOREST Theo Sand Leather Wallet, Diamond", tt)
+    assert is_other_product_label("Increase quantity by one Van Heusen Men's Solid Polo", tt)
+    # the item under test -> allowed
+    assert not is_other_product_label("Delete Allen Solly Men's Casual Polo Shirt (AMKP)", tt)
+    # generic labels with no product name -> allowed (not judged)
+    assert not is_other_product_label("Add to cart", tt)
+    assert not is_other_product_label("Proceed to checkout", tt)

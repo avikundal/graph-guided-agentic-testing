@@ -145,6 +145,7 @@ class BrowserUseIntentExecutor:
         # final payment and off-product navigation; everything else is allowed.
         self._safety_product_asin: str = ""
         self._safety_base_host: str = ""
+        self._safety_title_tokens = frozenset()
         self._vetoes: list[str] = []
 
     def set_safety_context(self, product_url: str) -> None:
@@ -153,6 +154,12 @@ class BrowserUseIntentExecutor:
         from .safety_guard import asin_from_url, host_of
         self._safety_product_asin = asin_from_url(product_url)
         self._safety_base_host = host_of(product_url)
+
+    def set_product_title(self, title: str) -> None:
+        """Once the product title is known, the veto can also block cart actions on
+        a DIFFERENT product (recommendation/cross-sell tiles)."""
+        from .safety_guard import product_tokens
+        self._safety_title_tokens = product_tokens(title)
 
     async def start(self) -> None:
         if self._browser_session is not None:
@@ -452,6 +459,7 @@ Do NOT click again if redirected to sign-in or another page.
                 action_type=action_type,
                 product_asin=self._safety_product_asin,
                 base_host=self._safety_base_host,
+                product_title_tokens=self._safety_title_tokens,
             )
             if reason:
                 self._vetoes.append(reason)
