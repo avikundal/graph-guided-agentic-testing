@@ -135,6 +135,12 @@ def render_report(r: ExplorationReport, *, debug: bool = False) -> str:
         lines.append(f"  - Feature concept coverage:                          {gi.get('concept_coverage_pct', 0)}%")
         lines.append(f"  - Structural gaps the graph flagged:                 {', '.join(gi.get('structural_gaps_flagged', [])) or 'none'}")
         lines.append(f"  - Net: {crawler_only} directly-validated behaviors -> {crawler_only + scen} documented + reasoned scenarios.")
+        surfaced = gi.get("graph_surfaced_missed", [])
+        if surfaced:
+            lines.append("")
+            lines.append("Engine 2 — scenarios the graph (LLM-over-graph) surfaced as MISSED by the crawl:")
+            for t in surfaced[:10]:
+                lines.append(f"  - {t}")
         lines.append("")
 
     cov = r.coverage or {}

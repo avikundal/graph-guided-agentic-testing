@@ -157,3 +157,13 @@ def test_action_label_maps_to_concept_for_ingestion():
     assert _action_to_concept("Proceed to checkout") == "action.proceed_to_checkout"
     assert _action_to_concept("Apply coupon") == "capability.promo_code"
     assert _action_to_concept("Some unrelated label") is None
+
+
+def test_graph_expansion_fallback_surfaces_missed():
+    # Engine 2 deterministic fallback: seen-but-unverified and expected-but-absent
+    # concepts become missed-scenario proposals (works with no LLM key).
+    from src.explorer.graph_expansion import _fallback_expand
+    out = _fallback_expand(["domain.subtotal"], ["domain.final_order_boundary"], 6)
+    assert any("subtotal" in p["title"].lower() for p in out)
+    assert any("final_order_boundary" in p["title"].lower() or "final order" in p["title"].lower() for p in out)
+    assert all("probe" in p and "why" in p for p in out)

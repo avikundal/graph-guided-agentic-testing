@@ -30,6 +30,7 @@ from ..graph.store import GraphStore
 from ..reporting.report import ExplorationEvent, ExplorationReport, render_report
 from .browser_use_executor import BrowserUseIntentExecutor, BrowserUseResult
 from .dynamic_discovery import discover_dynamic_intents
+from .graph_expansion import expand_from_graph
 from .frontier import IntentFrontier
 from .llm_neighbors import NeighborGenerator
 from .page_observer import PageObservation
@@ -118,6 +119,9 @@ class GraphGuidedExplorer:
         self.graph_driven_added = 0
         self.dynamic_discovered = 0
         self.restores_done = 0
+        # Engine 2 (LLM-over-graph) bookkeeping.
+        self.crawl_validated_concepts: set[str] = set()
+        self.graph_surfaced_scenarios: list[dict] = []
 
     def log(self, kind: str, msg: str) -> None:
         if self.debug:
@@ -281,6 +285,7 @@ class GraphGuidedExplorer:
             "graph_scenarios_boundary_safety": scenarios_total - missed,
             "actions_graph_pushed_into_dfs": self.graph_driven_added,
             "actions_discovered_dynamically": self.dynamic_discovered,
+            "graph_surfaced_missed": [s.get("title", "") for s in self.graph_surfaced_scenarios],
             "graph_pushed_actions_covered": coverage.get("graph_driven_covered", 0),
             "redundant_executions_avoided": redundant_avoided,
             "concept_coverage_pct": coverage.get("observed_pct", 0),
@@ -331,6 +336,27 @@ class GraphGuidedExplorer:
         # 5) Graph reasons about what the crawl missed.
         self._infer_graph_scenarios()
 
+        # 5b) ENGINE 2 — LLM-over-graph: read the graph (what was discovered +
+        # validated, what's expected, what's expected-but-absent) and reason about
+        # what the crawl MISSED, then feed those probes back to the crawl.
+        missed = await self._graph_expansion(STATE_CART)
+        if missed:
+            probes = "; ".join(m["probe"] for m in missed[:4])
+            res_probe = await self.executor.explore_autonomously(
+                goal=(
+                    "A testing knowledge-graph believes the following scenarios were "
+                    f"likely MISSED. Try each one on the current cart: {probes}"
+                ),
+                expected_state=STATE_CART, max_steps=12,
+            )
+            self._ingest_autonomous(res_probe, STATE_CART)
+            cart3 = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart after graph-probed scenarios")
+            cart3_obs = cart3.observation
+            if (_cart_item_count(cart3_obs) or 0) == 0:
+                cart3_obs = await self._restore_product_to_cart()
+            await self._ingest_observation(cart3_obs, source=SOURCE_CRAWLER)
+            self._infer_graph_scenarios()
+
         # 6) Proceed to the checkout boundary. The veto guarantees no order is placed.
         res3 = await self.executor.explore_autonomously(
             goal="Click 'Proceed to Checkout' to reach the secure checkout page. Do NOT place an order or pay — stop as soon as the checkout page appears.",
@@ -372,6 +398,7 @@ class GraphGuidedExplorer:
                 # so coverage and the missed-scenario reasoner can see it.
                 self.graph.write_intent(self.scope, self.run_id, ni, "validated", [f"autonomous {art.action_type}"])
                 self.observed_concepts.add(concept)
+                self.crawl_validated_concepts.add(concept)
                 # NOTE: outcome assertions (add_to_cart_validated, checkout reached)
                 # are set by the autonomous loop from REAL state checks, not from a
                 # click label — clicking 'Proceed to checkout' doesn't prove we
@@ -383,6 +410,33 @@ class GraphGuidedExplorer:
             )
         if res.error and "safety_veto" in res.error:
             self._event("blocked", "Safety veto (deny-list)", state, "vetoed", SOURCE_CRAWLER, [res.error[:120]])
+
+    async def _graph_expansion(self, state: str) -> list[dict]:
+        """Engine 2: the graph (via an LLM) reasons about what the crawl missed.
+        Records each as a graph-surfaced scenario and returns probes to feed back."""
+        try:
+            absent = self.graph.missing_expected_concepts(self.scope) or []
+        except Exception:
+            absent = [c for c in EXPECTED_CONCEPTS if c not in self.observed_concepts]
+        proposals = expand_from_graph(
+            feature=self.feature_display_key,
+            state=state,
+            observed_concepts=self.observed_concepts,
+            validated_concepts=self.crawl_validated_concepts,
+            expected_concepts=EXPECTED_CONCEPTS,
+            absent_concepts=absent,
+            visible_affordances=[],
+            max_items=6,
+        )
+        for p in proposals:
+            self.graph_surfaced_scenarios.append(p)
+            self._event(
+                "graph_surfaced", p["title"][:60], state, "graph_reasoned", SOURCE_GRAPH,
+                [p.get("why", "")[:80]] + ([f"concept={p['concept']}"] if p.get("concept") else []),
+            )
+        if proposals:
+            self.log("graph", f"Engine 2 surfaced {len(proposals)} missed scenario(s) the crawl skipped")
+        return proposals
 
     async def _dfs_loop(self, current_obs: PageObservation) -> None:
         for _ in range(self.max_steps):
