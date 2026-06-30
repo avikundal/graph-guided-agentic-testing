@@ -31,6 +31,7 @@ def expand_from_graph(
     absent_concepts: Iterable[str],
     visible_affordances: Iterable[str],
     max_items: int = 6,
+    debug: bool = False,
 ) -> list[dict]:
     """Return a list of MISSED-scenario proposals the graph reasons about.
 
@@ -45,7 +46,7 @@ def expand_from_graph(
 
     proposals = _llm_expand(
         feature, state, observed, validated, expected, absent,
-        list(visible_affordances)[:30], seen_not_validated, max_items,
+        list(visible_affordances)[:30], seen_not_validated, max_items, debug,
     )
     if not proposals:
         proposals = _fallback_expand(seen_not_validated, absent, max_items)
@@ -68,29 +69,64 @@ def expand_from_graph(
     return out
 
 
+# Curated edge-case scenarios a happy-path crawl skips — used by the deterministic
+# fallback so it proposes real missed behaviours, not passive concept names.
+_EDGE_SCENARIOS = {
+    "action.delete_item": (
+        "Removing the last item should empty the cart and zero the subtotal",
+        "Delete the cart item and confirm the subtotal/cart-count updates; if it was the last item, confirm an empty-cart state appears."),
+    "action.change_quantity": (
+        "Changing quantity should recalculate the subtotal",
+        "Increase the item quantity by one and confirm the subtotal recalculates accordingly."),
+    "action.save_for_later": (
+        "Save-for-later should move the item out of the active cart, and move-to-cart should restore it",
+        "Save the item for later, confirm it leaves the active cart, then move it back to the cart."),
+    "action.move_to_cart": (
+        "Moving a saved item back to the cart should restore it to the active cart",
+        "From Saved for later, move the item back to the cart and confirm it reappears in the active cart."),
+    "capability.promo_code": (
+        "Applying an invalid promo code should show an error, not silently accept it",
+        "Open the promo/coupon field, enter an obviously invalid code, apply it, and confirm an error message is shown."),
+    "action.proceed_to_checkout": (
+        "Proceed to checkout should reach the secure checkout / sign-in boundary",
+        "Click Proceed to Checkout and confirm a secure-checkout or sign-in boundary is reached (never place an order)."),
+    "domain.final_order_boundary": (
+        "The final order-placement control must exist at checkout and must never be auto-clicked",
+        "Confirm a final 'Place order' control exists at the checkout boundary; do NOT click it."),
+}
+
+
 def _fallback_expand(seen_not_validated: list[str], absent: list[str], max_items: int) -> list[dict]:
-    """Deterministic mirror: surface unverified-but-seen and expected-but-absent
-    concepts as missed scenarios, so the loop works with no LLM."""
+    """Deterministic mirror used when no LLM is available. Proposes real missed
+    behaviours for actionable concepts (skipping passive domain.* concepts, which
+    aren't scenarios to 'test')."""
     out: list[dict] = []
-    for c in seen_not_validated:
+    seen_titles: set[str] = set()
+    for c in list(seen_not_validated) + list(absent):
+        sc = _EDGE_SCENARIOS.get(c)
+        if not sc:
+            if c.startswith("action.") or c.startswith("capability."):
+                name = c.split(".")[-1].replace("_", " ")
+                sc = (f"Exercise '{name}' and verify its effect on the cart",
+                      f"Exercise the {name} control and confirm the cart/subtotal updates.")
+            else:
+                continue  # passive domain.* concept — not an actionable scenario
+        if sc[0].lower() in seen_titles:
+            continue
+        seen_titles.add(sc[0].lower())
         out.append({
-            "title": f"Verify the effect of {c}",
-            "why": f"{c} was seen but its effect was never confirmed this run.",
-            "probe": f"Exercise the {c.split('.')[-1].replace('_',' ')} control and confirm the cart/subtotal updates.",
-            "concept": c,
-        })
-    for c in absent:
-        out.append({
-            "title": f"Probe for expected-but-absent {c}",
-            "why": f"{c} is expected for this feature but was never observed — it may be hidden or missing.",
-            "probe": f"Look for a {c.split('.')[-1].replace('_',' ')} control (it may be behind a tab/expander) and exercise it.",
+            "title": sc[0],
+            "why": f"{c} was present but this behaviour was not verified this run.",
+            "probe": sc[1],
             "concept": c,
         })
     return out[:max_items]
 
 
-def _llm_expand(feature, state, observed, validated, expected, absent, visible, seen_not_validated, max_items) -> list[dict]:
+def _llm_expand(feature, state, observed, validated, expected, absent, visible, seen_not_validated, max_items, debug=False) -> list[dict]:
     if not settings.openai_api_key:
+        if debug:
+            print("[engine2][llm] no OPENAI_API_KEY — using deterministic fallback")
         return []
     try:
         from openai import OpenAI
@@ -129,6 +165,8 @@ subtotal). NEVER propose final payment / placing an order.
         data = json.loads(content)
         if isinstance(data, list):
             return [d for d in data if isinstance(d, dict)]
-    except Exception:
+    except Exception as exc:
+        if debug:
+            print(f"[engine2][llm] call failed ({exc}) — using deterministic fallback")
         return []
     return []

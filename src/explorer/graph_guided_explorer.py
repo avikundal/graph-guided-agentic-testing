@@ -427,6 +427,7 @@ class GraphGuidedExplorer:
             absent_concepts=absent,
             visible_affordances=[],
             max_items=6,
+            debug=self.debug,
         )
         for p in proposals:
             self.graph_surfaced_scenarios.append(p)

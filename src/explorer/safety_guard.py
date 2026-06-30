@@ -42,6 +42,10 @@ _ORDER_URL_PATTERNS = (
     "/checkout/p/", "/checkout/payment", "/payments/",
 )
 
+# Session-destroying account actions. Not payment, but they log the run out and
+# derail everything — a known-bad action worth a deny-list entry.
+_SESSION_TERMS = ("sign out", "signout", "log out", "logout", "switch account", "switch accounts")
+
 # Navigation-style actions whose destination URL we can inspect before it runs.
 _NAV_ACTIONS = {"navigate", "go_to_url", "open_tab", "new_tab"}
 
@@ -76,6 +80,10 @@ def veto_reason(
         return f"payment:text:{text[:40]}"
     if any(p in url for p in _ORDER_URL_PATTERNS):
         return f"payment:url:{url[:60]}"
+
+    # 1c) Session-destroying account actions (sign out / switch account).
+    if any(t in text for t in _SESSION_TERMS):
+        return f"session:{text[:30]}"
 
     # 2) Off-product navigation (only checkable for navigation-style actions;
     #    click-driven cross-product moves are handled by the prompt + post-hoc

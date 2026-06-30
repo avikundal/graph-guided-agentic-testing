@@ -261,7 +261,9 @@ You may freely click, select, and fill the controls you discover. Prefer trying 
 
 HARD RULES — never break these:
 - NEVER click final purchase or payment: {forbidden}. Stop before any payment step.
-- Do NOT navigate to a DIFFERENT product or any external site. Stay on this product and its own cart/checkout.
+- Do NOT navigate to a DIFFERENT product or any external site. Stay on THIS product and its own cart/checkout.
+- Only operate on the item under test. Do NOT add other or recommended products to the cart, and do NOT click 'Buy again', 'Customers also bought', or recommendation tiles.
+- Do NOT touch account controls: never click Sign out, Switch account, Sign in, or change the logged-in user.
 - Do not repeat a control you already tried.
 
 When you have exercised the available controls, call done with a short summary of what you tried and what changed.

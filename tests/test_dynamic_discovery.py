@@ -163,7 +163,9 @@ def test_graph_expansion_fallback_surfaces_missed():
     # Engine 2 deterministic fallback: seen-but-unverified and expected-but-absent
     # concepts become missed-scenario proposals (works with no LLM key).
     from src.explorer.graph_expansion import _fallback_expand
-    out = _fallback_expand(["domain.subtotal"], ["domain.final_order_boundary"], 6)
-    assert any("subtotal" in p["title"].lower() for p in out)
-    assert any("final_order_boundary" in p["title"].lower() or "final order" in p["title"].lower() for p in out)
+    out = _fallback_expand(["action.delete_item", "domain.subtotal"], ["capability.promo_code"], 6)
+    titles = " ".join(p["title"].lower() for p in out)
+    assert "empty the cart" in titles or "delete" in titles      # actionable scenario
+    assert "promo" in titles or "coupon" in titles                # absent capability surfaced
+    assert all("domain.subtotal" not in p.get("concept","") for p in out)  # passive concept skipped
     assert all("probe" in p and "why" in p for p in out)

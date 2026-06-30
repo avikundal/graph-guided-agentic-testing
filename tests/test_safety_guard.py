@@ -77,3 +77,9 @@ def test_url_parsers():
     assert asin_from_url("https://www.amazon.in/gp/product/B06Y2DV85R") == "B06Y2DV85R"
     assert asin_from_url("https://www.amazon.in/gp/cart/view.html") == ""
     assert host_of("https://www.amazon.in/dp/X") == "www.amazon.in"
+
+
+def test_blocks_session_destroying_actions():
+    assert _veto(target="Sign out")
+    assert _veto(target="Switch accounts")
+    assert _veto(target="Add to cart") is None   # still allowed
