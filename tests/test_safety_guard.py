@@ -96,3 +96,15 @@ def test_blocks_cart_action_on_a_different_product():
     # generic labels with no product name -> allowed (not judged)
     assert not is_other_product_label("Add to cart", tt)
     assert not is_other_product_label("Proceed to checkout", tt)
+
+
+def test_blocks_adding_other_product_from_cart_page():
+    from src.explorer.safety_guard import veto_reason
+    # On the cart page, any 'add to cart' is a recommendation for another item.
+    r = veto_reason(target_label="Add to cart, Allen Solly Solid Polo", action_url="",
+                    action_type="click", product_asin=PROD_ASIN, base_host=BASE_HOST, page_state="shopping_cart")
+    assert r and "cart_recommendation_add" in r
+    # on the PRODUCT page it's the item under test -> allowed
+    r2 = veto_reason(target_label="Add to cart", action_url="", action_type="click",
+                     product_asin=PROD_ASIN, base_host=BASE_HOST, page_state="product_detail")
+    assert r2 is None

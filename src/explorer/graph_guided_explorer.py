@@ -545,6 +545,7 @@ class GraphGuidedExplorer:
                     f"Try each one here: {probes}"
                 ),
                 expected_state=probe_state, max_steps=10,
+                block_repeats=False,  # the graph may deliberately re-test a behaviour
             )
             self._ingest_autonomous(res, probe_state, source=SOURCE_GRAPH, graph_concepts=surfaced_concepts)
             # The graph chose the page and we navigated there; after the probe we

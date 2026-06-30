@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 
-from ..domain.checkout_contract import FORBIDDEN_TERMS
+from ..domain.checkout_contract import FORBIDDEN_TERMS, STATE_CART
 
 
 class ForbiddenActionVeto(Exception):
@@ -100,6 +100,7 @@ def veto_reason(
     product_asin: str,
     base_host: str,
     product_title_tokens=frozenset(),
+    page_state: str = "",
 ) -> str | None:
     """Return a short reason string if this action must be blocked, else None."""
     text = (target_label or "").lower()
@@ -120,6 +121,14 @@ def veto_reason(
     #     boundary ("only the product under test").
     if action_type in {"click", "select"} and is_other_product_label(text, product_title_tokens):
         return "off_product:other_item"
+
+    # 2b) Adding ANOTHER product from the CART page (recommendation / cross-sell,
+    #     same brand or not). On the product page 'add to cart' is the item under
+    #     test; on the cart page it is always a different item being added.
+    if action_type in {"click", "select"} and page_state == STATE_CART and (
+        "add to cart" in text or "add to basket" in text
+    ):
+        return "off_product:cart_recommendation_add"
 
     # 2) Off-product navigation (navigation-style actions whose URL we can read).
     if action_type in _NAV_ACTIONS and url.startswith("http"):

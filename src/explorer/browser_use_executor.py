@@ -147,6 +147,10 @@ class BrowserUseIntentExecutor:
         self._safety_base_host: str = ""
         self._safety_title_tokens = frozenset()
         self._vetoes: list[str] = []
+        # Token-saving no-repeat guard: an action label done once is not run again
+        # (persists across bursts within a run). Active only when _block_repeats.
+        self._done_labels: set[str] = set()
+        self._block_repeats: bool = False
 
     def set_safety_context(self, product_url: str) -> None:
         """Tell the veto which product/marketplace is in scope so it can block
@@ -243,12 +247,18 @@ Do not navigate to any URL. Do not invent a URL from this prompt text.
 
     async def explore_autonomously(
         self, *, goal: str, expected_state: str, max_steps: int = 10, start_url: str | None = None,
+        block_repeats: bool = True,
     ) -> BrowserUseResult:
         """Let browser-use explore freely (it chooses its own actions), with the
         deny-list veto active. This is the crawl-discovery engine: the agent tries
         whatever controls it finds, and we capture the trace as discovered
-        scenarios. Safety is the veto, not a script."""
+        scenarios. Safety is the veto, not a script.
+
+        block_repeats: when True (free crawl), an action label already done is
+        vetoed so the agent can't burn tokens re-doing the same thing. Graph
+        probes pass False so the graph can deliberately re-test a behaviour."""
         await self.start()
+        self._block_repeats = block_repeats
         task = self._exploration_task(goal, expected_state)
         return await self._run_agent_task(
             task, label=f"explore:{expected_state}", start_url=start_url,
@@ -460,7 +470,17 @@ Do NOT click again if redirected to sign-in or another page.
                 product_asin=self._safety_product_asin,
                 base_host=self._safety_base_host,
                 product_title_tokens=self._safety_title_tokens,
+                page_state=getattr(obs, "state", "") or "",
             )
+            # No-repeat guard: an identifiable action done once must not run again
+            # (saves tokens). Tracked across bursts; only enforced when active.
+            if not reason and action_type in {"click", "select", "fill"}:
+                rk = _repeat_key(target)
+                if rk and rk in self._done_labels:
+                    if self._block_repeats:
+                        reason = "repeat:already_done"
+                elif rk:
+                    self._done_labels.add(rk)
             if reason:
                 self._vetoes.append(reason)
                 if self.debug:
@@ -777,6 +797,16 @@ def _action_type(action: Any) -> str:
     if "scroll" in joined:
         return "scroll"
     return "observe"
+
+
+def _repeat_key(label: str) -> str:
+    """A stable key for the no-repeat guard, only for identifiable actions. Empty
+    for too-short or index-only labels (we can't tell those apart, so don't block).
+    Distinct typed values (COUPON2023 vs INVALID) stay distinct -> not blocked."""
+    s = (label or "").strip().lower()
+    if len(s) < 3 or s.startswith("index="):
+        return ""
+    return s[:80]
 
 
 def _action_url(action: Any) -> str:
