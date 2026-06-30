@@ -99,6 +99,27 @@ def test_respects_max_intents_cap():
     assert len(intents) == 10
 
 
+def test_skips_recommendation_tiles_and_cross_sells():
+    # The real failure: cart-page recommendation tiles whose product names contain
+    # option keywords ("colour"/"flavour") were mistaken for variant controls and
+    # the agent wandered onto other products. Controls for the current item stay.
+    els = [
+        _el(1, "a", "Streax Permanent Hair Colour, 100% Grey coverage", "a#rec1",
+            href="https://www.amazon.in/dp/B0XYZ"),                                  # other product link
+        _el(2, "a", "Purepet Dog Food 20kg | Chicken & Vegetable Flavour", "a#rec2",
+            href="/dp/B0ABC"),                                                       # other product link
+        _el(3, "button", "Buy again - Purepet Dog Food", "button#ba"),              # cross-sell phrase
+        _el(4, "button", "Save for later Allen Solly Polo", "button#sfl",
+            aria_label="Save for later Allen Solly Polo"),                           # real cart control
+        _el(5, "input", "Coral", "input#sw", type="radio", role="radio", aria_label="Coral"),  # real option
+    ]
+    labels = _by_label(discover_dynamic_intents(_obs(els, state=STATE_CART)))
+    assert any(l.startswith("save for later") for l in labels)
+    assert "coral" in labels
+    assert all("hair colour" not in l and "dog food" not in l for l in labels)
+    assert all("buy again" not in l for l in labels)
+
+
 def test_skips_internal_widget_scaffolding():
     # The real Amazon "twister" widget noise that flooded an earlier run: live
     # region announcers and internal ids must NOT become discovered actions.

@@ -71,6 +71,23 @@ _GENERIC_SUCCESS = [
 _OPTION_TAGS = {"select"}
 _OPTION_ROLES = {"radio", "listbox", "combobox", "menuitemradio", "option", "switch"}
 
+# A control that operates on the CURRENT product/cart tends to start with an
+# action verb. A recommendation/cross-sell tile is a product name (often with a
+# "|" spec separator) linking to another product. We keep the former, drop the
+# latter — otherwise "Streax Hair Colour" or "Dog Food ... Flavour" get mistaken
+# for variant options because their names contain option keywords.
+_ACTION_PREFIXES = (
+    "save for later", "save for", "move to cart", "move to", "add to list",
+    "add to wish", "delete", "remove", "increase quantity", "decrease quantity",
+    "increase", "decrease", "change quantity", "select", "choose", "apply",
+    "add gift", "gift option", "gift wrap", "gift receipt",
+)
+# Links carrying these are navigation to another product / listing, not a control.
+_PRODUCT_LINK_HINTS = ("/dp/", "/gp/product/", "/gp/aw/d/", "/b/", "/s?", "/stores/", "/shop/")
+# Phrases that mark a recommendation / cross-sell rather than a current-item control.
+_SKIP_PHRASES = ("buy again", "buy it again", "sponsored", "customers also",
+                 "see all", "see more", "view more", "compare with", "related to")
+
 
 def _slug(text: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")
@@ -131,6 +148,33 @@ def _is_option_control(el: UIElement) -> bool:
     if (el.type or "").lower() in {"radio"}:
         return True
     return False
+
+
+def _is_navigation_to_other_product(el: UIElement) -> bool:
+    """True for links/tiles that take you to a different product or listing."""
+    href = (getattr(el, "href", None) or "").lower()
+    if (el.tag or "").lower() == "a" and any(h in href for h in _PRODUCT_LINK_HINTS):
+        return True
+    return False
+
+
+def _is_current_item_control(el: UIElement, label: str) -> bool:
+    """Keep controls that operate on THIS product/cart; drop product tiles.
+
+    A genuine control either is a structural option control, or reads as an action
+    ("Save for later", "Increase quantity", "Coral", "XL"). A recommendation tile
+    reads as a product title — long, often with a "|" spec separator.
+    """
+    low = label.lower()
+    if "|" in label:
+        return False
+    if _is_option_control(el):
+        return True
+    if any(low.startswith(p) for p in _ACTION_PREFIXES):
+        return True
+    # Short, control-like labels (a colour name, a size) are fine; long strings
+    # are almost always product titles, not controls.
+    return len(label) <= 32
 
 
 def _classify(el: UIElement, haystack: str) -> tuple[str, str] | None:
@@ -197,6 +241,15 @@ def discover_dynamic_intents(
             continue
         label = _label_for(el)
         if not label:
+            continue
+        # Don't follow recommendation / cross-sell tiles to other products, and
+        # don't mistake a product title (which may contain "colour"/"flavour"/
+        # "size") for a variant control of the current item.
+        if _is_navigation_to_other_product(el):
+            continue
+        if any(p in label.lower() for p in _SKIP_PHRASES):
+            continue
+        if not _is_current_item_control(el, label):
             continue
         haystack = el.haystack
 
