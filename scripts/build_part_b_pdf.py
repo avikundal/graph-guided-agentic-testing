@@ -253,9 +253,9 @@ def build(path):
                   'does the validating and storing, and the graph is the thing that decides what\'s still risky, '
                   'what\'s missing, and what\'s quietly gone stale.', body))
     e.append(para('One thing I want to be upfront about: this isn\'t architecture astronomy. I\'m not drawing boxes '
-                  'I\'ve never built. Almost every claim in here already has a tiny working version in the Part A '
-                  'prototype, and I\'ve put a table at the end (section 11) pointing at the exact function that backs '
-                  'each one — so you don\'t have to take my word for any of it.', body))
+                  'I\'ve never built. Many of the core claims already have working seeds in Part A, and I\'ve put a '
+                  'table at the end (section 11) pointing at the exact function that backs each one — the table maps '
+                  'the production design back to the working prototype.', body))
 
     e.append(tbl([
         [para('What the prototype already does',cellb), para('What it has to become in production',cellb)],
@@ -269,7 +269,7 @@ def build(path):
     # 0 exec summary
     e.append(para('0 · The short version', h1))
     e.append(para('Let me start with what the prototype already does, because the production plan is really just '
-                  '"do this, but make it survive contact with reality." The browser agent walks through Amazon '
+                  '"preserve this loop, but harden it for production conditions." The browser agent walks through Amazon '
                   'checkout, everything it sees gets written into Neo4j as typed facts, and then the graph points out '
                   'behaviours the agent skipped — like "does changing the quantity update the subtotal?" or "does '
                   'deleting an item?" And it doesn\'t just list them in a report; it hands the doable ones back to the '
@@ -279,7 +279,7 @@ def build(path):
                   'not allowed to make anything up beyond what was actually observed plus the rules we\'ve vetted. '
                   'In between sits a deterministic harness that owns the parts you can\'t leave to a model: what to '
                   'test, what\'s safe, what state we\'re in, what to re-run, and what counts as proven.', body))
-    e.append(para('Here\'s the failure I actually lose sleep over. It isn\'t the agent missing a button — you can '
+    e.append(para('Here\'s the production failure mode I worry about most. It isn\'t the agent missing a button — you can '
                   'always crawl again. It\'s <b>confident wrongness</b>: the agent swears checkout worked when it '
                   'really hit a login wall; a button\'s selector quietly changed after a deploy and nobody noticed; '
                   'the graph quietly assumes a feature was tested when it never even appeared. Every design choice in '
@@ -325,6 +325,13 @@ def build(path):
                   '<i>more</i> restrictive, never less. In the prototype that is '
                   '<font name="Courier">normalize_suggestion</font> ignoring any risk the model tries to attach — a '
                   'model cannot talk a destructive action into looking "safe".', body))
+    e.append(para('One more boundary, and it is the one that decides whether this is a platform or just an Amazon '
+                  'script: app-specific quirks must never leak into the core. The prototype\'s smart-wagon cart URLs, '
+                  'marketplace cart differences and subtotal parsing all belong in a per-feature/app adapter. The core '
+                  'owns only the invariant machinery — the action contract, safety, evidence, graph writes, confidence '
+                  'and eval. The honest production test is whether the same core can drive Amazon checkout and, say, a '
+                  'SaaS settings-save flow with only adapter changes; if a new app forces a core change, the boundary '
+                  'is in the wrong place.', body))
     e.append(para('1.1 · The runtime contract', h2))
     e.append(para('Every item the planner hands the executor carries a tight contract. This was the single change '
                   'that turned the prototype from "the agent wandered off" into a disciplined executor.', body))
@@ -489,8 +496,8 @@ def build(path):
     e.append(PageBreak())
     # 5 cost
     e.append(para('5 · What this costs, and which model does what', h1))
-    e.append(para('The strategy here is emphatically not "use the smartest model everywhere" — that\'s how you go '
-                  'broke. It\'s matching each job to the cheapest thing that can actually do it, with real budgets. '
+    e.append(para('The strategy here is emphatically not "use the smartest model everywhere" — that is how inference '
+                  'cost becomes uncontrolled. It\'s matching each job to the cheapest thing that can actually do it, with real budgets. '
                   'Most of the work is plain code and costs nothing. The high-volume clicking goes to a small, fast '
                   'model. The big expensive model only comes out for the rare, genuinely hard stuff — discovering new '
                   'rules offline, settling eval disputes — where its reasoning earns its price.', body))
@@ -524,6 +531,22 @@ def build(path):
     ], [W*0.42,W*0.58]))
     e.append(para('The anti-pattern I refuse is "LLM-judge every step in real time". It makes cost scale with token '
                   'usage and makes the reasoning non-repeatable — the two things I most want to avoid.', body))
+
+    e.append(para('5.2 · Production tooling choices', h2))
+    e.append(para('Tooling should fall out of the boundaries above, not the other way round. I would reach for each of '
+                  'these because of a specific production failure mode it prevents — not because it is fashionable.', body))
+    e.append(tbl([
+        [para('Layer',cellb),para('Choice I would start with',cellb),para('Why',cellb),para('What I would avoid',cellb)],
+        [para('Browser execution',cell),para('Playwright + constrained LLM executor',cell),para('Playwright gives deterministic browser control; the LLM only chooses fuzzy targets.',cell),para('A fully autonomous browser agent with no action contract.',cell)],
+        [para('Graph store',cell),para('Neo4j',cell),para('Core queries are traversals: CodeArtifact → Selector → Concept → Scenario.',cell),para('Storing graph-shaped dependencies only in relational tables.',cell)],
+        [para('Artifact storage',cell),para('S3 / GCS / blob storage',cell),para('DOM, screenshots and traces are large and tenant-sensitive; Neo4j stores refs only.',cell),para('Putting large DOM/screenshot blobs inside Neo4j.',cell)],
+        [para('Workflow orchestration',cell),para('Temporal / durable queue',cell),para('Crawls are long-running, retryable, stateful workflows.',cell),para('Fire-and-forget cron jobs.',cell)],
+        [para('Search / vector memory',cell),para('OpenSearch / pgvector / LanceDB (auxiliary)',cell),para('Useful for selector repair and semantic matching; the graph stays source of truth.',cell),para('Letting vector similarity replace graph truth.',cell)],
+        [para('Observability',cell),para('OpenTelemetry + run traces + artifact refs',cell),para('Every decision should be replayable across agent, validator and graph writes.',cell),para('Plain logs with no trace IDs.',cell)],
+        [para('Eval store',cell),para('Versioned golden apps + labeled trajectories',cell),para('Needed for prompt/model regression and confidence calibration.',cell),para('Shipping prompt changes without canaries.',cell)],
+    ], [W*0.17,W*0.24,W*0.34,W*0.25]))
+    e.append(para('Tools are replaceable; the important design constraint is that the graph, evidence store, workflow '
+                  'engine and evaluator have separate ownership boundaries.', body))
 
     # 6 tenancy
     e.append(para('6 · A hundred customers, kept apart', h1))
@@ -568,6 +591,14 @@ def build(path):
                   'rejecting a query that forgot its tenant scope; and cost-per-crawl blowing past budget because of a '
                   'retry loop. The prototype already emits a good chunk of this — wander detection, validation '
                   'overrides, per-source accounting — in its run report.', body))
+    e.append(para('7.1 · Test-account and environment strategy', h2))
+    e.append(para('A production agentic testing platform cannot depend on arbitrary customer production accounts. Each '
+                  'tenant needs dedicated test accounts with seeded data, synthetic payment methods, reset hooks and '
+                  'cleanup policies, so a crawl starts from a known state and leaves no residue behind. For commerce '
+                  'flows the safest target is a staging or sandbox environment with production-like UI but '
+                  'non-production payment rails. And if a customer can only grant production access, risky actions are '
+                  'downgraded to observe-only unless there is an explicit sandbox guarantee — the platform never gets '
+                  'to assume an environment is safe to mutate.', body))
 
     # 8 blast radius
     e.append(para('8 · PR blast radius', h1))
@@ -618,6 +649,17 @@ def build(path):
         [para('4 · Multi-tenant beta',cell),para('Tenant isolation, budgets, artifact retention, observability',cell),para('100-customer architecture exercised under load and cost tests.',cell)],
         [para('5 · PR blast radius',cell),para('CodeArtifact → Selector → Concept → Scenario traversal',cell),para('A PR produces a bounded risk report and a retest plan.',cell)],
     ], [W*0.20,W*0.42,W*0.38]))
+    e.append(para('10.1 · Rollout modes', h2))
+    e.append(para('Autonomy is earned, not assumed, so the platform moves through rollout modes rather than switching '
+                  'full execution on from day one:', body))
+    e.append(tbl([
+        [para('Mode',cellb),para('What the platform is allowed to do',cellb)],
+        [para('1 · Observe-only',cell),para('Crawl and build the graph; no mutating clicks.',cell)],
+        [para('2 · Recommend',cell),para('Surface inferred scenarios and blast radius, but do not execute them.',cell)],
+        [para('3 · Gated execution',cell),para('Safe actions auto-run; mutating/destructive actions require policy approval.',cell)],
+        [para('4 · Autonomous safe execution',cell),para('Only after confidence, flake rate and safety checks pass thresholds.',cell)],
+    ], [W*0.30,W*0.70]))
+    e.append(para('This lets the platform earn autonomy instead of assuming it.', body))
 
     # 11 grounding
     e.append(para('11 · How Part A grounds every claim here', h1))
