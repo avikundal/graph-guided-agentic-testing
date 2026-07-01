@@ -4,51 +4,37 @@ import html
 import json
 import re
 import uuid
-from dataclasses import asdict
 from typing import Any
 from urllib.parse import urlparse
 
 from ..config import DATA_DIR
 from ..domain.amazon_auth import AUTH_FILE, base_url_for, reset_amazon_cart, verify_auth_state
 from ..domain.checkout_contract import (
+    CAUSAL_EXPECTATIONS,
     EXPECTED_CONCEPTS,
     INFERENCE_RULES,
     INTENTS,
-    RISK_DESTRUCTIVE_CLICK,
-    RISK_FORBIDDEN_CLICK,
     RISK_MUTATING_CLICK,
-    RISK_OBSERVE_ONLY,
     SOURCE_CRAWLER,
-    SOURCE_DOMAIN,
     SOURCE_GRAPH,
     STATE_CART,
-    STATE_CART_CONFIRMATION,
     STATE_CHECKOUT,
     STATE_PRODUCT,
 )
 from ..graph.store import GraphStore
 from ..reporting.report import ExplorationEvent, ExplorationReport, render_report
 from .browser_use_executor import BrowserUseIntentExecutor, BrowserUseResult
-from .dynamic_discovery import discover_dynamic_intents
 from .graph_expansion import expand_from_graph
-from .safety_guard import is_other_product_label, product_tokens
-from .frontier import IntentFrontier
-from .llm_neighbors import NeighborGenerator
 from .page_observer import PageObservation
+from .safety_guard import is_cart_relevant_action, is_other_product_label, product_tokens
 from .semantic_normalizer import NormalizedIntent, SemanticNormalizer
 
 
 class GraphGuidedExplorer:
-    """Browser-use powered graph-guided DFS frontier explorer.
+    """Autonomous browser-use crawler followed by graph-directed gap probes."""
 
-    Correct responsibility split for Part A:
-      - browser-use owns actual crawling/execution using DOM + ARIA + screenshot + page understanding.
-      - DFS/frontier/graph owns what should be explored next, safety, state, replay, and reasoning.
-
-    The explorer no longer micromanages obvious clicks like Add to Cart with CSS selectors.
-    It gives browser-use a narrow one-intent task, ingests the returned artifacts, then updates
-    Neo4j and the exploration frontier.
-    """
+    _CRAWL_MAX_ROUNDS = 3
+    _GRAPH_MAX_ROUNDS = 2
 
     def __init__(
         self,
@@ -57,18 +43,12 @@ class GraphGuidedExplorer:
         tenant_id: str,
         project_id: str,
         feature_key: str,
-        max_steps: int = 24,
-        max_neighbors: int = 5,
         headless: bool = True,
-        allow_mutating: bool = True,
-        allow_destructive: bool = True,
         enable_living_graph: bool = False,
         reset_graph: bool = False,
         reset_cart: bool = False,
         debug: bool = False,
-        autonomous: bool = False,
     ):
-        self.autonomous = autonomous
         self.product_url = product_url
         self.scope = {
             "tenant_id": tenant_id,
@@ -77,22 +57,15 @@ class GraphGuidedExplorer:
         }
         self.feature_display_key = feature_key
         self.run_id = f"run_{uuid.uuid4().hex[:12]}"
-        self.max_steps = max_steps
-        self.max_neighbors = max_neighbors
         self.headless = headless
-        self.allow_mutating = allow_mutating
-        self.allow_destructive = allow_destructive
         self.enable_living_graph = enable_living_graph
         self.reset_graph = reset_graph
         self.reset_cart = reset_cart
         self.debug = debug
 
         self.executor = BrowserUseIntentExecutor(headless=headless, debug=debug)
-        # Deny-list safety scope: block off-product navigation + final payment.
         self.executor.set_safety_context(product_url)
         self.normalizer = SemanticNormalizer()
-        self.frontier = IntentFrontier()
-        self.neighbor_generator = NeighborGenerator()
         self.graph = GraphStore()
         self.events: list[ExplorationEvent] = []
         self.scenarios: list[dict[str, Any]] = []
@@ -102,7 +75,6 @@ class GraphGuidedExplorer:
         self.observed_signatures: set[str] = set()
 
         self.checkout_reached = False
-        self.final_forbidden_detected = False
         self.add_to_cart_validated = False
         self.proceed_to_checkout_validated = False
         self.cart_preexisting = False
@@ -112,25 +84,20 @@ class GraphGuidedExplorer:
         self.product_title = ""
         self.cart_title = ""
         self.product_asin = _asin_from_url(product_url)
-        # Cart/checkout must stay on the SAME Amazon domain as the product
-        # (amazon.in product -> amazon.in cart), otherwise the item is added on
-        # one marketplace while the cart is read on another (empty) one.
         self.cart_url = _cart_url_for(product_url)
         self.cart_count_baseline: int | None = None
-        self.graph_driven_added = 0
-        self.dynamic_discovered = 0
         self.restores_done = 0
-        # Engine 2 (LLM-over-graph) bookkeeping.
+
         self.crawl_validated_concepts: set[str] = set()
         self.graph_surfaced_scenarios: list[dict] = []
         self.graph_directed_clicks = 0
-        # Distinct action labels actually clicked — the action-level signal that
-        # tells us the crawler has genuinely run dry (richer than concept count).
         self.clicked_labels: set[str] = set()
+        self.action_attempt_seq = 0
+        self.graph_probe_round = 0
 
     def log(self, kind: str, msg: str) -> None:
         if self.debug:
-            print(f"[dfs][{kind}] {msg}")
+            print(f"[{kind}] {msg}")
 
     async def run(self) -> str:
         self.graph.verify()
@@ -138,13 +105,13 @@ class GraphGuidedExplorer:
         if self.reset_graph:
             self.graph.reset_scope(self.scope)
         self.graph.init_run(self.scope, self.run_id, self.product_url)
-        # Seed the feature contract so absence is a queryable graph property.
         self.graph.seed_expected_concepts(self.scope, EXPECTED_CONCEPTS)
+        self.graph.seed_causal_expectations(self.scope, CAUSAL_EXPECTATIONS)
 
         signed_in, reason = await verify_auth_state(headless=True, base_url=base_url_for(self.product_url))
         if not signed_in:
             return (
-                "NOT SIGNED IN for this marketplace — run scripts/login_amazon.py "
+                "NOT SIGNED IN for this marketplace - run scripts/login_amazon.py "
                 f"(log in on {base_url_for(self.product_url)}).\n" + reason
             )
         if not AUTH_FILE.exists():
@@ -163,16 +130,24 @@ class GraphGuidedExplorer:
                 expected_state=STATE_PRODUCT,
                 label="Initial product page",
             )
-            self._record_replay_like(initial, "Initial product page", STATE_PRODUCT)
-            current_obs = await self._observe_update_frontier(initial.observation, source=SOURCE_CRAWLER)
-            # Now the product title is known — let the veto also block cart actions
-            # on a DIFFERENT product (recommendations/cross-sells).
-            self.executor.set_product_title(self.product_title)
-            if self.autonomous:
-                await self._autonomous_loop(current_obs)
+            self._record_observation_check(initial, "Initial product page", STATE_PRODUCT)
+            current_obs = await self._ingest_observation(initial.observation, source=SOURCE_CRAWLER)
+            if current_obs.state != STATE_PRODUCT:
+                self._event(
+                    "blocked",
+                    "Product page not grounded",
+                    current_obs.state,
+                    "aborted",
+                    SOURCE_CRAWLER,
+                    [
+                        f"expected={STATE_PRODUCT}",
+                        f"observed={current_obs.state}",
+                        "crawl/graph skipped because graph needs real page evidence before probing",
+                    ],
+                )
+                self.log("stop", f"aborted: initial product page observed as {current_obs.state}")
             else:
-                await self._seed_domain_intents()
-                await self._dfs_loop(current_obs)
+                await self._autonomous_loop(current_obs)
         finally:
             await self.executor.close()
 
@@ -180,18 +155,16 @@ class GraphGuidedExplorer:
         coverage = self._coverage_summary()
         report = ExplorationReport(
             run_id=self.run_id,
-            feature="Amazon checkout — browser-use + graph-guided DFS frontier exploration",
+            feature="Amazon checkout - autonomous browser-use + graph-guided gap exploration",
             events=self.events,
-            frontier_stats=asdict(self.frontier.stats),
             graph_scenarios=self.scenarios,
             living_graph=living,
             run_assertions=self._run_assertions(),
             safety_notes=[
-                "browser-use executes the actual UI actions using DOM, ARIA labels, screenshots/layout, and page context.",
-                "DFS/graph decides what to explore next; browser-use decides how to perform the narrow action.",
-                "Only two things are off-limits: final payment (Buy Now / Place Order / Pay) and navigating to a different product. Everything else — quantity, delete/remove, save-for-later, promo/offers, gift options — is clicked and verified.",
-                "Destructive and mutating cart actions are executed by default, verified by a real cart item-count/subtotal delta, then the cart is auto-restored (re-add) so the flow still completes. Disable with --no-destructive / --no-mutating.",
-                "State gate and replay run before intent execution; cart actions are not searched on checkout pages.",
+                "browser-use executes UI actions using DOM, ARIA labels, screenshots/layout, and page context.",
+                "The free crawl stops on action-level convergence, not on first concept stagnation.",
+                "Graph expansion runs after crawler convergence and sends targeted probes back to browser-use.",
+                "The deny-list veto blocks final payment, cross-product/external navigation, repeated free-crawl actions, and account/session-destroying controls.",
             ],
             inspect_command=(
                 f"./.venv/bin/python scripts/inspect_graph.py --tenant-id {self.scope['tenant_id']} "
@@ -206,12 +179,6 @@ class GraphGuidedExplorer:
         return report_text
 
     def _write_outputs(self, report: ExplorationReport, report_text: str) -> None:
-        """Persist the run report and a structured sample-output artifact.
-
-        Writes both a per-run copy and a stable `latest_*` copy so a reviewer can
-        open the deliverable (discovered vs. inferred vs. missed scenarios)
-        without re-running the crawl.
-        """
         out_dir = DATA_DIR / "run_logs"
         out_dir.mkdir(parents=True, exist_ok=True)
         discovered = [
@@ -244,12 +211,10 @@ class GraphGuidedExplorer:
         observed = self.observed_concepts & expected
         validated = self._validated_concepts() & expected
         inferred_missed = [s for s in self.scenarios if s.get("status") == "INFERRED_MISSED"]
-        # How many graph-fed actions the crawler actually exercised (executed or
-        # safely observed because of a risk gate).
         graph_events = [e for e in self.events if e.source == SOURCE_GRAPH]
-        covered = len({
+        graph_covered = len({
             e.label for e in graph_events
-            if e.kind in {"clicked", "found"} or e.status in {"validated", "clicked_observed", "observed_only", "destructive_observed_not_clicked"}
+            if e.kind in {"clicked", "found"} or e.status in {"graph_directed", "crawl_validated"}
         })
         absent = []
         if self.graph.enabled:
@@ -266,66 +231,40 @@ class GraphGuidedExplorer:
             "observed_pct": round(100.0 * len(observed) / total, 1),
             "validated": len(validated),
             "inferred_missed": len(inferred_missed),
-            "graph_driven_added": self.graph_driven_added,
-            "graph_driven_covered": covered,
+            "graph_directed_covered": graph_covered,
             "absent": absent,
         }
 
     def _graph_impact_summary(self, coverage: dict[str, Any]) -> dict[str, Any]:
-        """Quantify what the graph layer contributed vs. the bare crawler.
-
-        'Crawler alone' = behaviours browser-use validated by direct action.
-        'With graph' adds: reasoned scenarios the agent never executed, actions
-        the graph pushed into exploration, redundant work the graph memory
-        avoided, and the absence it flagged.
-        """
-        validated_total = sum(1 for e in self.events if e.status == "validated")
-        validated_graph = sum(1 for e in self.events if e.status == "validated" and e.source == SOURCE_GRAPH)
+        validation_statuses = {"crawl_validated", "graph_directed"}
+        validated_total = sum(1 for e in self.events if e.status in validation_statuses)
+        validated_graph = sum(1 for e in self.events if e.status in validation_statuses and e.source == SOURCE_GRAPH)
         validated_direct = validated_total - validated_graph
         scenarios_total = len(self.scenarios)
         missed = sum(1 for s in self.scenarios if s.get("status") == "INFERRED_MISSED")
-        st = self.frontier.stats
-        redundant_avoided = st.skipped_completed + st.skipped_duplicate + st.pruned_after_completion
         return {
             "behaviors_validated_by_crawler_alone": validated_direct,
             "scenarios_surfaced_only_by_graph": scenarios_total,
             "graph_scenarios_missed_gaps": missed,
             "graph_scenarios_boundary_safety": scenarios_total - missed,
-            "actions_graph_pushed_into_dfs": self.graph_driven_added,
-            "actions_discovered_dynamically": self.dynamic_discovered,
             "graph_surfaced_missed": [s.get("title", "") for s in self.graph_surfaced_scenarios],
             "graph_directed_clicks": self.graph_directed_clicks,
-            "graph_pushed_actions_covered": coverage.get("graph_driven_covered", 0),
-            "redundant_executions_avoided": redundant_avoided,
+            "graph_directed_covered": coverage.get("graph_directed_covered", 0),
             "concept_coverage_pct": coverage.get("observed_pct", 0),
             "structural_gaps_flagged": coverage.get("absent", []),
         }
 
-    # Convergence budgets for the dynamic loop (also bound cost/time). Phase A
-    # may take a few progress rounds + 2 stagnant rounds, so the cap is higher.
-    _CRAWL_MAX_ROUNDS = 5
-    _GRAPH_MAX_ROUNDS = 3
-
     async def _autonomous_loop(self, current_obs: PageObservation) -> None:
-        """Dynamic two-engine loop: let browser-use run FREE until it stops finding
-        new concepts (crawl convergence), THEN let the graph close the gaps —
-        reasoning about what was missed and probing it — repeating until the graph
-        produces nothing new (graph convergence). Then proceed to checkout.
-        """
-        # Seed: add the product to the cart so there is a cart to explore.
-        res = await self.executor.explore_autonomously(
-            goal="You are on a product page. Try any product options you see (size, colour, quantity), then add THIS product to the cart.",
-            expected_state=STATE_PRODUCT, max_steps=8,
-        )
+        if current_obs.state != STATE_PRODUCT:
+            self.log("stop", f"crawl skipped: expected product_detail, got {current_obs.state}")
+            return
+        add_spec = INTENTS.get("action.add_to_cart")
+        add_intent = self.normalizer._from_spec(add_spec, SOURCE_CRAWLER, None, 0.95, 0.95, 0.0, "required cart setup")
+        add_intent.expected_state = STATE_PRODUCT
+        res = await self.executor.execute_intent(add_intent)
         self._ingest_autonomous(res, STATE_PRODUCT)
         await self._open_cart_after_add()
 
-        # ---- PHASE A: crawl runs FREE until ACTION-LEVEL stagnation ----
-        # Stop only after 2 consecutive rounds with no new concept, no new clicked
-        # label, AND no new validated concept — not merely no new canonical concept.
-        # Many distinct controls collapse onto one concept (increase vs decrease
-        # quantity, save-then-restore, invalid coupon, remove the last item), so
-        # concept-count alone would stop while real controls sit untried.
         last_obs = current_obs
         stagnant = 0
         prev_sig = None
@@ -335,13 +274,14 @@ class GraphGuidedExplorer:
             untried = self._untried_visible_labels(last_obs)
             hint = (" Controls you have NOT tried yet include: " + "; ".join(sorted(untried)[:6]) + ".") if untried else ""
             res = await self.executor.explore_autonomously(
-                goal=("Test this shopping cart thoroughly. Try EVERY distinct control you have not "
-                      "tried yet — increase AND decrease quantity, save for later, move back to cart, "
-                      "remove/delete, apply a coupon (try an invalid one too), gift options." + hint),
-                expected_state=STATE_CART, max_steps=12,
+                goal=(
+                    "Test this shopping cart thoroughly. Try every distinct control you have not tried yet: "
+                    "increase and decrease quantity, save for later, move back to cart, remove/delete, "
+                    "apply a coupon including an invalid value, and gift options." + hint
+                ),
+                expected_state=STATE_CART,
+                max_steps=8,
             )
-            # The agent navigates as it wants — we do NOT pull it back to the cart.
-            # Just ingest wherever it ended (actions + that page's concepts).
             self._ingest_autonomous(res, res.observation.state or STATE_CART)
             await self._ingest_observation(res.observation, source=SOURCE_CRAWLER)
             last_obs = res.observation
@@ -350,9 +290,6 @@ class GraphGuidedExplorer:
             prev_sig = sig
             self.log("crawl", f"round {crawl_rounds}: concepts={sig[0]} labels={sig[1]} validated={sig[2]} untried={len(untried)} stagnant={stagnant}")
 
-        # ---- PHASE B: the graph closes the gaps until it yields nothing new ----
-        # Each surfaced scenario is probed ON THE PAGE IT BELONGS TO: the concept
-        # implies its state (contract), so we navigate there before probing.
         graph_rounds = 0
         while graph_rounds < self._GRAPH_MAX_ROUNDS:
             graph_rounds += 1
@@ -364,13 +301,13 @@ class GraphGuidedExplorer:
             await self._run_graph_probes(missed)
             self.log("graph", f"gap-closing round {graph_rounds}: surfaced {len(missed)}, concepts now {len(self.observed_concepts)}")
             if len(self.observed_concepts) == before:
-                break  # the graph's probes revealed nothing new -> converged
+                break
 
-        # ---- PHASE C: proceed to the checkout boundary (veto prevents ordering) ----
-        # The agent navigates itself — we don't force it back to the cart.
         res3 = await self.executor.explore_autonomously(
-            goal="Go to your shopping cart and click the 'Proceed to Checkout' button to reach the secure checkout page. Do NOT place an order or pay — stop as soon as the checkout page appears.",
-            expected_state=STATE_CART, max_steps=4,
+            goal="Go to your shopping cart and click Proceed to Checkout to reach the secure checkout page. Do NOT place an order or pay. Stop as soon as checkout appears.",
+            expected_state=STATE_CART,
+            max_steps=4,
+            block_repeats=False,
         )
         self._ingest_autonomous(res3, STATE_CHECKOUT)
         final_obs = res3.observation
@@ -383,8 +320,6 @@ class GraphGuidedExplorer:
         self.log("stop", f"converged after {crawl_rounds} free-crawl + {graph_rounds} graph round(s)")
 
     async def _open_cart_after_add(self) -> PageObservation:
-        """Open the canonical cart after the seed add; confirm the item landed
-        (restore if not), and set the add-to-cart assertion."""
         cart = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Open cart after add")
         obs = cart.observation
         if (_cart_item_count(obs) or 0) > 0:
@@ -393,20 +328,17 @@ class GraphGuidedExplorer:
             if not self.cart_preexisting:
                 self.cart_delta_verified = True
             self.observed_concepts.update({"action.add_to_cart", "domain.cart_item"})
+            self.crawl_validated_concepts.add("action.add_to_cart")
         else:
             obs = await self._restore_product_to_cart()
             if (_cart_item_count(obs) or 0) > 0:
                 self.add_to_cart_validated = True
+                self.crawl_validated_concepts.add("action.add_to_cart")
         await self._ingest_observation(obs, source=SOURCE_CRAWLER)
-        # Now the cart-line title is known — give the hard veto its brand tokens
-        # (the product-page title was often empty).
         self.executor.set_product_title(self.product_title or self.cart_title)
         return obs
 
     def _untried_visible_labels(self, obs: PageObservation) -> set[str]:
-        """Visible, interactable controls on the cart that the crawler has NOT
-        clicked yet (scoped to the item under test). Drives the 'are we really
-        done?' signal and hints the next burst toward unexplored controls."""
         brand = product_tokens(self.product_title or self.cart_title)
         out: set[str] = set()
         for el in getattr(obs, "elements", None) or []:
@@ -414,31 +346,27 @@ class GraphGuidedExplorer:
                 continue
             if not (getattr(el, "clickable", False) or getattr(el, "interactable", False)):
                 continue
-            lbl = " ".join((getattr(el, "aria_label", "") or getattr(el, "text", "")
-                            or getattr(el, "value", "") or "").split())
+            lbl = " ".join((getattr(el, "aria_label", "") or getattr(el, "text", "") or getattr(el, "value", "") or "").split())
             low = lbl.lower()[:60]
             if len(low) < 3 or low.startswith("<") or low in self.clicked_labels:
                 continue
             if is_other_product_label(lbl, brand):
                 continue
+            if obs.state == STATE_CART and not is_cart_relevant_action(lbl):
+                continue
             out.add(low)
         return out
 
-    def _ingest_autonomous(self, res: BrowserUseResult, state: str, *, source: str = SOURCE_CRAWLER,
-                           graph_concepts: set[str] | None = None) -> None:
-        """Ingestion bridge: record what browser-use did BOTH as events and as
-        graph concepts.
-
-        Attribution is per-click and strict: a click is credited to the GRAPH
-        only when it runs during a graph-directed probe AND fulfills a concept the
-        graph actually surfaced (`graph_concepts`). Anything browser-use wanders
-        into on its own — even during a graph probe — stays the crawler's, so
-        browser-use's discoveries are never logged as graph-found."""
+    def _ingest_autonomous(
+        self,
+        res: BrowserUseResult,
+        state: str,
+        *,
+        source: str = SOURCE_CRAWLER,
+        graph_concepts: set[str] | None = None,
+    ) -> None:
         graph_concepts = graph_concepts or set()
-        probe = (source == SOURCE_GRAPH)
-        # Brand tokens of the item under test. product_title (from the product
-        # page) is often empty because the initial observe is a summary, so fall
-        # back to cart_title, read reliably from OUR ASIN's cart line.
+        probe = source == SOURCE_GRAPH
         title_tokens = product_tokens(self.product_title or self.cart_title)
         seen: set[str] = set()
         for art in res.artifacts:
@@ -449,41 +377,93 @@ class GraphGuidedExplorer:
             if not label or key in seen:
                 continue
             seen.add(key)
-            # Safety net: never record an action on a DIFFERENT product, even if it
-            # slipped past the veto — keeps the graph scoped to the item under test.
             if is_other_product_label(label, title_tokens):
                 continue
-            self.clicked_labels.add(key)  # action-level convergence signal
+            if (art.state or state) == STATE_CART and not is_cart_relevant_action(label):
+                continue
+            self.clicked_labels.add(key)
             concept = _action_to_concept(label)
             act_state = art.state or state
-            is_graph = probe and concept is not None and concept in graph_concepts
+            is_graph = probe
             eff_source = SOURCE_GRAPH if is_graph else SOURCE_CRAWLER
+            status = "graph_directed" if is_graph and concept else ("graph_explored" if is_graph else ("crawl_validated" if concept else "crawl_explored"))
+            self._write_action_attempt(
+                art,
+                res,
+                status=status,
+                source=eff_source,
+                concept=concept,
+                probe_key=self._probe_key_for_concept(concept) if is_graph else None,
+            )
             if concept:
                 ni = NormalizedIntent(
-                    canonical_key=concept, human_label=label[:60], expected_state=act_state,
-                    source=eff_source, risk=RISK_MUTATING_CLICK, priority=0.6, confidence=0.9,
+                    canonical_key=concept,
+                    human_label=label[:60],
+                    expected_state=act_state,
+                    source=eff_source,
+                    risk=RISK_MUTATING_CLICK,
+                    priority=0.6,
+                    confidence=0.9,
                 )
-                self.graph.write_intent(self.scope, self.run_id, ni, "validated", [f"autonomous {art.action_type}"])
+                self.graph.write_intent(self.scope, self.run_id, ni, status, [f"autonomous {art.action_type}"])
                 self.observed_concepts.add(concept)
                 self.crawl_validated_concepts.add(concept)
-                if is_graph:
-                    self.graph_directed_clicks += 1
-            status = "graph_directed" if is_graph else ("crawl_validated" if concept else "crawl_explored")
+            if is_graph:
+                self.graph_directed_clicks += 1
             self._event(
-                "clicked", (label[:58] or concept or "action"), act_state, status, eff_source,
-                [("graph-directed probe" if is_graph else "autonomous") + f" {art.action_type}"]
-                + ([f"concept={concept}"] if concept else []),
+                "clicked",
+                label[:58] or concept or "action",
+                act_state,
+                status,
+                eff_source,
+                [("graph-directed probe" if is_graph else "autonomous") + f" {art.action_type}"] + ([f"concept={concept}"] if concept else []),
             )
         if res.error and "safety_veto" in res.error:
             self._event("blocked", "Safety veto (deny-list)", state, "vetoed", source, [res.error[:120]])
 
+    def _write_action_attempt(
+        self,
+        art,
+        res: BrowserUseResult,
+        *,
+        status: str,
+        source: str,
+        concept: str | None,
+        probe_key: str | None,
+    ) -> None:
+        self.action_attempt_seq += 1
+        before = res.before
+        after = res.observation
+        self.graph.write_action_attempt(
+            self.scope,
+            self.run_id,
+            action_id=f"action_{self.action_attempt_seq:04d}",
+            step=self.action_attempt_seq,
+            source=source,
+            action_type=art.action_type,
+            target_label=html.unescape(html.unescape((art.target_label or "").strip()))[:180],
+            selector=(art.selector or "")[:240],
+            status=status,
+            page_state_before=(before.state if before else art.state) or "",
+            page_state_after=(after.state if after else "") or "",
+            url_before=(before.url if before else art.url) or "",
+            url_after=(after.url if after else "") or "",
+            concept=concept,
+            probe_key=probe_key,
+            evidence=list(art.evidence or [])[:12],
+            veto_reason=_extract_veto_reason(res.error),
+            repeat_key=_action_repeat_key(art.target_label),
+        )
+
     async def _graph_expansion(self, state: str) -> list[dict]:
-        """Engine 2: the graph (via an LLM) reasons about what the crawl missed.
-        Records each as a graph-surfaced scenario and returns probes to feed back."""
         try:
             absent = self.graph.missing_expected_concepts(self.scope) or []
         except Exception:
             absent = [c for c in EXPECTED_CONCEPTS if c not in self.observed_concepts]
+        try:
+            graph_context = self.graph.graph_view(self.scope) or {}
+        except Exception:
+            graph_context = {}
         proposals = expand_from_graph(
             feature=self.feature_display_key,
             state=state,
@@ -492,22 +472,40 @@ class GraphGuidedExplorer:
             expected_concepts=EXPECTED_CONCEPTS,
             absent_concepts=absent,
             visible_affordances=[],
-            max_items=6,
+            graph_context=graph_context,
+            max_items=4,
             debug=self.debug,
         )
+        self.graph_probe_round += 1
         for p in proposals:
+            p["key"] = _probe_key(p, self.graph_probe_round, len(self.graph_surfaced_scenarios) + 1)
             self.graph_surfaced_scenarios.append(p)
+            self.graph.write_graph_probe(
+                self.scope,
+                self.run_id,
+                key=p["key"],
+                title=p["title"],
+                why=p.get("why", ""),
+                instruction=p.get("probe", ""),
+                concept=p.get("concept"),
+                target_state=self._state_for_concept(p.get("concept") or ""),
+                status="proposed",
+                round_no=self.graph_probe_round,
+                source=SOURCE_GRAPH,
+            )
             self._event(
-                "graph_surfaced", p["title"][:60], state, "graph_reasoned", SOURCE_GRAPH,
+                "graph_surfaced",
+                p["title"][:60],
+                state,
+                "graph_reasoned",
+                SOURCE_GRAPH,
                 [p.get("why", "")[:80]] + ([f"concept={p['concept']}"] if p.get("concept") else []),
             )
         if proposals:
-            self.log("graph", f"Engine 2 surfaced {len(proposals)} missed scenario(s) the crawl skipped")
+            self.log("graph", f"surfaced {len(proposals)} missed scenario(s)")
         return proposals
 
     def _state_for_concept(self, concept: str) -> str:
-        """The page a concept lives on — so the graph's probe can be run on the
-        RIGHT page. Derived from the contract (concept -> expected state)."""
         spec = INTENTS.get(concept)
         if spec and getattr(spec, "expected_states", None):
             return spec.expected_states[0]
@@ -517,268 +515,68 @@ class GraphGuidedExplorer:
             return STATE_CHECKOUT
         return STATE_CART
 
-    async def _run_graph_probes(self, missed: list[dict]) -> None:
-        """Probe each graph-surfaced scenario ON THE PAGE IT BELONGS TO: group by
-        target state, navigate there, then let browser-use try them. The crawler's
-        hands, on the page the graph chose."""
-        from collections import defaultdict
-        by_state: dict[str, list[dict]] = defaultdict(list)
-        for m in missed:
-            by_state[self._state_for_concept(m.get("concept") or "")].append(m)
+    def _probe_key_for_concept(self, concept: str | None) -> str | None:
+        if not concept:
+            return None
+        for p in reversed(self.graph_surfaced_scenarios):
+            if p.get("concept") == concept and p.get("key"):
+                return p["key"]
+        return None
 
-        for st, items in by_state.items():
-            # The checkout boundary is observe-only — never probe-click near payment.
+    async def _run_graph_probes(self, missed: list[dict]) -> None:
+        for m in missed:
+            st = self._state_for_concept(m.get("concept") or "")
             if st == STATE_CHECKOUT:
                 continue
             if st == STATE_PRODUCT:
-                await self.executor.navigate_and_observe(self.product_url, expected_state=STATE_PRODUCT, label="Graph -> product page for probe")
+                await self.executor.navigate_and_observe(self.product_url, expected_state=STATE_PRODUCT, label="Graph probe product page")
                 probe_state = STATE_PRODUCT
             else:
-                await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Graph -> cart for probe")
+                await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Graph probe cart")
                 probe_state = STATE_CART
-            probes = "; ".join(m["probe"] for m in items[:4])
-            surfaced_concepts = {m["concept"] for m in items if m.get("concept")}
-            self.log("graph", f"probing {len(items)} graph scenario(s) on {st}")
+            surfaced_concepts = {m["concept"]} if m.get("concept") else set()
+            self.log("graph", f"probing 1 scenario on {st}: {m.get('title', '')[:60]}")
+            if m.get("key"):
+                self.graph.write_graph_probe(
+                    self.scope,
+                    self.run_id,
+                    key=m["key"],
+                    title=m["title"],
+                    why=m.get("why", ""),
+                    instruction=m.get("probe", ""),
+                    concept=m.get("concept"),
+                    target_state=st,
+                    status="executing",
+                    round_no=self.graph_probe_round,
+                    source=SOURCE_GRAPH,
+                )
             res = await self.executor.explore_autonomously(
                 goal=(
-                    "A testing knowledge-graph believes these scenarios were MISSED on THIS page. "
-                    f"Try each one here: {probes}"
+                    "A testing knowledge graph believes this one scenario was missed on this page. "
+                    f"Try only this scenario, then stop: {m['probe']}"
                 ),
-                expected_state=probe_state, max_steps=10,
-                block_repeats=False,  # the graph may deliberately re-test a behaviour
+                expected_state=probe_state,
+                max_steps=4,
+                block_repeats=False,
             )
             self._ingest_autonomous(res, probe_state, source=SOURCE_GRAPH, graph_concepts=surfaced_concepts)
-            # The graph chose the page and we navigated there; after the probe we
-            # just ingest wherever the agent ended — no forced return.
             await self._ingest_observation(res.observation, source=SOURCE_CRAWLER)
-
-    async def _dfs_loop(self, current_obs: PageObservation) -> None:
-        for _ in range(self.max_steps):
-            if current_obs.state == STATE_CHECKOUT:
-                self.checkout_reached = True
-                self._infer_graph_scenarios()
-                self.log("stop", "checkout reached; terminal prototype boundary")
-                return
-
-            intent = self.frontier.pop_for_state(current_obs.state)
-            if intent is None:
-                transition = self._next_transition_intent(current_obs.state)
-                if transition and self.frontier.push(transition):
-                    self._event("frontier", transition.human_label, transition.expected_state, "added", transition.source, [transition.canonical_key, "state transition after local frontier exhausted"])
-                intent = self.frontier.pop_for_state(current_obs.state)
-
-            if intent is None:
-                intent = self.frontier.pop_any()
-                if intent is None:
-                    self._infer_graph_scenarios()
-                    self.log("stop", "frontier empty")
-                    return
-
-            current_obs = await self._process_intent(intent, current_obs)
-            self._infer_graph_scenarios()
-
-    async def _process_intent(self, intent: NormalizedIntent, current_obs: PageObservation) -> PageObservation:
-        # Phase 1 execution memory: a canonical intent that already succeeded
-        # in this run must never execute again, even if an old duplicate was
-        # still queued before completion.
-        if self.frontier.is_completed(intent.canonical_key):
-            self.frontier.stats.skipped_completed += 1
-            self._event(
-                "blocked",
-                intent.human_label,
-                current_obs.state,
-                "already_completed",
-                intent.source,
-                [intent.canonical_key, "canonical intent already succeeded in this run"],
-            )
-            return current_obs
-
-        # State gate before execution. If the page is wrong, ask browser-use to replay/navigate
-        # to the expected state, then observe; do not ground against the wrong page.
-        # Forbidden / observe-only intents (e.g. Final Order Boundary) never justify
-        # navigating deeper just to look — that only produces guaranteed replay
-        # failures. Record them from the current page instead.
-        skip_replay = intent.risk in {RISK_FORBIDDEN_CLICK, RISK_OBSERVE_ONLY} or not intent.click_allowed
-        if current_obs.state != intent.expected_state and not skip_replay:
-            self.frontier.stats.postponed_wrong_state += 1
-            self.frontier.stats.requires_replay += 1
-            self._event(
-                "replay",
-                f"Reacquire {intent.expected_state} for {intent.human_label}",
-                current_obs.state,
-                "requires_replay",
-                intent.source,
-                [f"current={current_obs.state}", f"expected={intent.expected_state}"],
-            )
-            replay_result = await self._replay_to(intent.expected_state)
-            self._record_replay_like(replay_result, f"Reacquire {intent.expected_state}", intent.expected_state)
-            if replay_result.observation.state != intent.expected_state:
-                self.frontier.stats.replay_failed += 1
-                self.frontier.mark_blocked(intent, "replay_failed")
-                self._event("blocked", intent.human_label, replay_result.observation.state, "replay_failed", intent.source, [f"expected={intent.expected_state}", f"observed={replay_result.observation.state}"])
-                return replay_result.observation
-            current_obs = await self._observe_update_frontier(replay_result.observation, source=SOURCE_CRAWLER)
-
-        # Phase 3 readiness gate: some Amazon transitional pages (especially
-        # smart-wagon after add/quantity changes) report shopping_cart but are
-        # not stable enough for checkout. Stabilize before asking browser-use
-        # to execute the checkout transition.
-        readiness_result = await self._ensure_ready_for_intent(intent, current_obs)
-        if readiness_result is not None:
-            self._record_replay_like(readiness_result, f"Readiness check for {intent.human_label}", intent.expected_state)
-            current_obs = await self._observe_update_frontier(readiness_result.observation, source=SOURCE_CRAWLER)
-            if current_obs.state != intent.expected_state:
-                self.frontier.stats.replay_failed += 1
-                self.frontier.mark_blocked(intent, "readiness_failed")
-                self._event("blocked", intent.human_label, current_obs.state, "readiness_failed", intent.source, [f"expected={intent.expected_state}", f"observed={current_obs.state}"])
-                return current_obs
-
-        if intent.risk == RISK_FORBIDDEN_CLICK:
-            self.frontier.stats.blocked_forbidden += 1
-            self.frontier.mark_completed(intent, "forbidden boundary recorded")
-            self.observed_concepts.add(intent.canonical_key)
-            self.graph.write_intent(self.scope, self.run_id, intent, "forbidden_blocked", ["safety boundary"])
-            self._event("blocked", intent.human_label, current_obs.state, "forbidden", intent.source, ["safety boundary observed; never clicked"])
-            return current_obs
-
-        if intent.risk == RISK_DESTRUCTIVE_CLICK and not self.allow_destructive:
-            self.frontier.stats.observed_only += 1
-            self.frontier.mark_completed(intent, "destructive action observed but not clicked")
-            self.observed_concepts.add(intent.canonical_key)
-            self.graph.write_intent(self.scope, self.run_id, intent, "destructive_observed_not_clicked", ["destructive clicks disabled by default"])
-            self._event("found", intent.human_label, current_obs.state, "destructive_observed_not_clicked", intent.source, [intent.canonical_key, "destructive clicks disabled by default"])
-            return current_obs
-
-        if intent.risk == RISK_MUTATING_CLICK and not self.allow_mutating:
-            self.frontier.stats.observed_only += 1
-            self.frontier.mark_blocked(intent, "mutating disabled")
-            self.graph.write_intent(self.scope, self.run_id, intent, "mutating_disabled", ["set --allow-mutating to execute"])
-            self._event("blocked", intent.human_label, current_obs.state, "mutating_disabled", intent.source, ["set --allow-mutating to execute"])
-            return current_obs
-
-        if intent.risk == RISK_OBSERVE_ONLY or not intent.click_allowed:
-            self.frontier.stats.observed_only += 1
-            self.frontier.mark_completed(intent, "observe-only intent recorded")
-            self.observed_concepts.add(intent.canonical_key)
-            self.graph.write_intent(self.scope, self.run_id, intent, "observed_only", intent.success_criteria)
-            self._event("found", intent.human_label, current_obs.state, "observed_only", intent.source, [intent.canonical_key] + list(intent.success_criteria[:2]))
-            return current_obs
-
-        # ANY cart mutation (quantity, delete, save-for-later, promo, gift, ...) is
-        # verified the same authoritative way: snapshot the canonical cart, perform
-        # the action, then re-read the cart and require a real item-count/subtotal
-        # delta. This is genuine testing — not browser-use's flaky in-window guess.
-        # Product-page options (state != cart) are not cart mutations and validate
-        # via the executor's own verdict.
-        mutation_pre = None
-        is_cart_mutation = (
-            current_obs.state == STATE_CART
-            and intent.risk in {RISK_MUTATING_CLICK, RISK_DESTRUCTIVE_CLICK}
-        )
-        if is_cart_mutation:
-            pre = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label=f"Cart before: {intent.human_label}")
-            mutation_pre = (_cart_item_count(pre.observation), _cart_subtotal(pre.observation))
-
-        # Let browser-use execute the action. Do not rediscover selectors manually.
-        result = await self.executor.execute_intent(intent)
-        after = result.observation
-        status = result.status
-        ui_action_taken = result.action_type in {"click", "fill", "select"}
-
-        if is_cart_mutation and mutation_pre is not None:
-            changed, after, ev = await self._verify_cart_mutation(mutation_pre)
-            result.evidence = (result.evidence or []) + ev
-            status = "validated" if changed else "clicked_observed"
-            post_count = _cart_item_count(after)
-            # A delete/save that empties the cart is a verified pass even if the
-            # subtotal text disappears with the last line.
-            if (mutation_pre[0] or 0) > 0 and post_count == 0:
-                changed, status = True, "validated"
-            self._event(
-                "replay", f"Verify {intent.human_label}", after.state,
-                "validated" if changed else "not_validated", SOURCE_CRAWLER, ev,
-            )
-            # Self-healing: if the active cart is now empty, add the product back so
-            # the destructive/save test does not dead-end the end-to-end flow. The
-            # removal was already proven; this restores state and demonstrates a
-            # complete add -> remove -> verify -> re-add test loop.
-            if changed and post_count == 0:
-                after = await self._restore_product_to_cart()
-
-        # Reaching secure checkout is the success criterion for Proceed to Checkout.
-        # Some marketplaces (e.g. amazon.in) insert a benign interstitial
-        # ("Continue to checkout" on a same-day/bundle carousel), so a second click
-        # is expected and must not be penalised as "wandering" — PROVIDED it is not
-        # a sign-in redirect and not a wrong-target click (logo/search/cart).
-        # Forbidden final-purchase actions are still never clicked.
-        if intent.canonical_key == "action.proceed_to_checkout" and status != "validated":
-            if _checkout_reached_ok(after.state, after.url, result.error):
-                status = "validated"
-                result.evidence = (result.evidence or []) + ["secure checkout reached (benign interstitial step allowed)"]
-
-        if status == "validated":
-            self.frontier.stats.executed += 1
-            self.frontier.mark_completed(intent, "browser-use validated intent")
-            self.observed_concepts.add(intent.canonical_key)
-        elif status == "already_satisfied":
-            # Useful state proof, but not a direct browser click.
-            self.frontier.mark_completed(intent, "intent already satisfied in current state")
-            self.observed_concepts.add(intent.canonical_key)
-        elif status in {"blocked_signin"}:
-            # Auth boundary after checkout click is a meaningful observed boundary,
-            # but not a validated secure-checkout transition.
-            self.frontier.mark_blocked(intent, status)
-            self.observed_concepts.add("domain.checkout_boundary")
-        elif intent.risk in {RISK_MUTATING_CLICK, RISK_DESTRUCTIVE_CLICK} and ui_action_taken:
-            # A side-effecting UI action already fired (e.g. the quantity stepper
-            # was clicked and the cart did update) even though browser-use could
-            # not confirm the change within its short observe window. Never re-run
-            # a mutating/destructive intent or the cart keeps changing on every
-            # re-discovery — this is what inflated the cart to 4 items per run.
-            self.frontier.stats.executed += 1
-            self.frontier.mark_completed(intent, f"{status}; side effect applied, not repeated")
-            self.observed_concepts.add(intent.canonical_key)
-        else:
-            self.frontier.mark_failed(intent, status)
-
-        if intent.canonical_key == "action.add_to_cart":
-            if status == "validated":
-                self.add_to_cart_validated = True
-            if self.add_to_cart_validated:
-                self.cart_provenance = "cart_confirmation_or_cart_delta_verified"
-                if not self.cart_preexisting:
-                    self.cart_delta_verified = True
-        elif intent.canonical_key == "action.go_to_cart" and status in {"validated", "already_satisfied"}:
-            self.observed_concepts.add("domain.cart_item")
-        elif intent.canonical_key == "action.proceed_to_checkout" and status == "validated":
-            self.checkout_reached = True
-            self.proceed_to_checkout_validated = True
-            self.observed_concepts.add("domain.checkout_boundary")
-        elif intent.canonical_key == "action.change_quantity" and status == "validated":
-            self.observed_concepts.add("domain.subtotal")
-
-        self.graph.write_intent(self.scope, self.run_id, intent, status, result.evidence + [f"browser_use_selector={result.selector}"])
-        if status in {"validated", "clicked_observed"} and ui_action_taken:
-            kind = "clicked"
-        elif status == "already_satisfied":
-            kind = "found"
-        else:
-            kind = "blocked"
-        self._event(kind, intent.human_label, current_obs.state, status, intent.source, result.evidence[:5] + ([f"next_state={after.state}"] if after.state else []))
-        # After Add to Cart, open the full canonical cart right away so its controls
-        # (quantity, delete, save-for-later, promo) are discovered and queued BEFORE
-        # Proceed to Checkout is considered. The add-to-cart interstitial is sparse,
-        # which previously hid those controls and let checkout fire too early.
-        if intent.canonical_key == "action.add_to_cart" and status == "validated" and after.state != STATE_CART:
-            cart_nav = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Open full cart after add")
-            after = cart_nav.observation
-        obs = await self._observe_update_frontier(after, source=SOURCE_CRAWLER)
-        return obs
+            if m.get("key"):
+                self.graph.write_graph_probe(
+                    self.scope,
+                    self.run_id,
+                    key=m["key"],
+                    title=m["title"],
+                    why=m.get("why", ""),
+                    instruction=m.get("probe", ""),
+                    concept=m.get("concept"),
+                    target_state=st,
+                    status="executed",
+                    round_no=self.graph_probe_round,
+                    source=SOURCE_GRAPH,
+                )
 
     async def _ingest_observation(self, obs: PageObservation, *, source: str) -> PageObservation:
-        """Ingestion only (no catalogue/dynamic/neighbor discovery): write the
-        observation + its typed concepts into the graph. Used by the autonomous
-        crawl, where browser-use is the discovery engine — not the catalogue."""
         self._capture_identity_from_observation(obs)
         self.step += 1
         self.visited_states.add(obs.state)
@@ -790,73 +588,12 @@ class GraphGuidedExplorer:
             evidence = sorted(obs.detected_concepts)[:8]
             state_ev = obs.state_evidence.get(obs.state, [])[:3]
             self._event("observed", f"Observe {obs.state}", obs.state, "observed", source, evidence + state_ev)
-        return obs
-
-    async def _observe_update_frontier(self, obs: PageObservation, *, source: str) -> PageObservation:
-        self._capture_identity_from_observation(obs)
-        self.step += 1
-        self.visited_states.add(obs.state)
-        self.observed_concepts |= obs.detected_concepts
-        self.graph.write_observation(self.scope, self.run_id, self.step, obs)
-
-        signature = f"{obs.state}:{','.join(sorted(obs.detected_concepts))}:{len(obs.elements)}"
-        if signature not in self.observed_signatures:
-            self.observed_signatures.add(signature)
-            evidence = sorted(obs.detected_concepts)[:8]
-            state_ev = obs.state_evidence.get(obs.state, [])[:3]
-            self._event("observed", f"Observe {obs.state}", obs.state, "observed", source, evidence + state_ev)
-
-        crawler_intents = self.normalizer.normalize_observation(obs, source=SOURCE_CRAWLER)
-        # Dynamic, page-driven discovery: whatever actionable controls THIS product
-        # actually exposes — size/colour/variant options, quantity selects,
-        # save-for-later, gift options, etc. — become executable intents too, not
-        # just the fixed catalogue. Risk is classified deterministically and
-        # safety-first, and every one still flows through the same gate/validator.
-        dynamic_intents = discover_dynamic_intents(obs, source=SOURCE_CRAWLER)
-        self.dynamic_discovered += len(dynamic_intents)
-        crawler_intents += dynamic_intents
-        added = self.frontier.push_many(crawler_intents)
-        for ni in added:
-            self.graph.write_intent(self.scope, self.run_id, ni, "frontier_added", [ni.reason])
-            if ni.risk == RISK_OBSERVE_ONLY or not ni.click_allowed:
-                if ni.confidence >= 0.60:
-                    self._event("found", ni.human_label, ni.expected_state, "observed_only", ni.source, [ni.canonical_key, ni.reason, f"conf={ni.confidence}"])
-
-        if obs.state == STATE_CART and {"domain.cart_item", "domain.subtotal"} & self.observed_concepts:
-            # CLOSE THE LOOP: the graph reasons about what SHOULD be tested here
-            # (missed-scenario pivots) and feeds those actions back into the DFS
-            # frontier FIRST — deterministically, independent of the LLM. This is
-            # the graph improving coverage, not just reporting it.
-            graph_intents = self._graph_driven_intents(obs.state)
-            for n in self.frontier.push_many(graph_intents):
-                self.graph_driven_added += 1
-                self.graph.write_intent(self.scope, self.run_id, n, "frontier_added", ["graph-inferred missed scenario fed back into DFS"])
-                self._event("frontier", n.human_label, n.expected_state, "added", n.source, [n.canonical_key, "graph reasoning -> coverage"])
-
-            visible = [e.label for e in obs.elements if e.visible][:80]
-            neighbors = self.neighbor_generator.generate(
-                observed_concepts=self.observed_concepts,
-                current_state=obs.state,
-                visible_affordances=visible,
-                max_neighbors=self.max_neighbors,
-                normalizer=self.normalizer,
-            )
-            added_neighbors = self.frontier.push_many(neighbors)
-            for n in added_neighbors:
-                self.graph.write_intent(self.scope, self.run_id, n, "frontier_added", ["generated from graph/LLM neighbor search"])
-                self._event("frontier", n.human_label, n.expected_state, "added", n.source, [n.canonical_key, n.risk])
         return obs
 
     async def _cart_preflight(self) -> None:
         result = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart preflight")
         obs = result.observation
-        # Baseline item count lets us prove a delta from THIS run even when a
-        # previous run (or the user) left items in the cart, so provenance does
-        # not silently report cart_delta_verified=false on a polluted cart.
         self.cart_count_baseline = _cart_item_count(obs)
-        # Pre-existing must mean "had items", not "the word subtotal appears" —
-        # an empty cart still renders "Subtotal (0 items)". Trust the nav count;
-        # only fall back to concept detection if the count can't be parsed.
         if self.cart_count_baseline is not None:
             self.cart_preexisting = self.cart_count_baseline > 0
         else:
@@ -872,94 +609,19 @@ class GraphGuidedExplorer:
             }
         })
 
-    async def _seed_domain_intents(self) -> None:
-        # Seed only gateway actions. Observed/LLM frontier fills the rest.
-        for key in ["action.add_to_cart", "action.go_to_cart"]:
-            spec = INTENTS[key]
-            ni = self.normalizer._from_spec(spec, SOURCE_DOMAIN, None, 0.85, 0.85, 0.0, "domain gateway seed")
-            if self.frontier.push(ni):
-                self._event("frontier", ni.human_label, ni.expected_state, "added", ni.source, [ni.canonical_key, "domain gateway seed"])
-
-    def _next_transition_intent(self, state: str) -> NormalizedIntent | None:
-        if state == STATE_PRODUCT and not self.add_to_cart_validated:
-            key = "action.add_to_cart"
-        elif state in {STATE_PRODUCT, STATE_CART_CONFIRMATION}:
-            key = "action.go_to_cart"
-        elif state == STATE_CART:
-            key = "action.proceed_to_checkout"
-        else:
-            return None
-        spec = INTENTS[key]
-        return self.normalizer._from_spec(spec, SOURCE_DOMAIN, None, 0.80, 0.80, 0.0, f"transition from {state}")
-
-    async def _ensure_ready_for_intent(self, intent: NormalizedIntent, current_obs: PageObservation) -> BrowserUseResult | None:
-        """Return a fresh observation when the current page needs stabilization.
-
-        This is intentionally narrow. It does not change browser-use behavior;
-        it prevents sending browser-use into a transitional cart surface for the
-        checkout button, which caused ELEMENT_NOT_FOUND on Amazon smart-wagon.
-        """
-        if intent.canonical_key != "action.proceed_to_checkout":
-            return None
-        if current_obs.state != STATE_CART:
-            return None
-        text = (current_obs.text or "").lower()
-        url = (current_obs.url or "").lower()
-        has_checkout_concept = "action.proceed_to_checkout" in current_obs.detected_concepts
-        transitional = (
-            "smart-wagon" in url
-            or "newitems=" in url
-            or "placeholder" in text
-            or "still loading" in text
-            or not has_checkout_concept
-        )
-        if not transitional:
-            return None
-        self.frontier.stats.requires_replay += 1
-        self._event(
-            "replay",
-            "Stabilize cart before Proceed to Checkout",
-            current_obs.state,
-            "requires_replay",
-            intent.source,
-            ["reason=cart_not_ready_for_checkout", f"url={current_obs.url[:120]}", f"has_checkout_concept={has_checkout_concept}"],
-        )
-        return await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Stable cart before checkout")
-
-    async def _replay_to(self, state: str) -> BrowserUseResult:
-        if state == STATE_PRODUCT:
-            return await self.executor.navigate_and_observe(self.product_url, expected_state=STATE_PRODUCT, label="Replay product page")
-        if state in {STATE_CART, STATE_CART_CONFIRMATION}:
-            return await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Replay cart page")
-        if state == STATE_CHECKOUT:
-            # Checkout is reached through the frontier; do not replay by clicking final actions.
-            return await self.executor.observe_current(label="Replay checkout unsupported", expected_state=STATE_CHECKOUT)
-        return await self.executor.observe_current(label=f"Replay {state}", expected_state=state)
-
-    def _record_replay_like(self, result: BrowserUseResult, label: str, expected_state: str) -> None:
-        ok = result.observation.state == expected_state or (expected_state == STATE_CART_CONFIRMATION and result.observation.state == STATE_CART)
+    def _record_observation_check(self, result: BrowserUseResult, label: str, expected_state: str) -> None:
+        ok = result.observation.state == expected_state
         status = "verified" if ok else "failed"
         ev = [f"expected={expected_state}", f"observed={result.observation.state}"] + result.evidence[:4]
         self._event("replay", label, result.observation.state, status, SOURCE_CRAWLER, ev)
 
     def _capture_identity_from_observation(self, obs: PageObservation) -> None:
-        """Capture product identity by ASIN — no hardcoded name, no false matches.
-
-        Identity is anchored on the ASIN from the product URL. Recommendation
-        carousels ("customers also bought ...") have *different* ASINs, so a name
-        is only trusted when it sits next to OUR ASIN. Cart/product match is
-        proven by OUR ASIN actually appearing in the cart observation, never by a
-        loose title overlap (which previously matched a recommended book).
-        """
-        # Titles are evidence only, and are read from the alt text adjacent to
-        # our ASIN so a recommended product can never be mistaken for ours.
         if obs.state == STATE_PRODUCT and not self.product_title:
             self.product_title = _title_near_asin(obs, self.product_asin)[:220]
         if obs.state == STATE_CART:
             cart_name = _title_near_asin(obs, self.product_asin)
             if cart_name and not self.cart_title:
                 self.cart_title = cart_name[:220]
-            # Item-count delta from this run, robust to a pre-existing cart.
             count = _cart_item_count(obs)
             if (
                 self.add_to_cart_validated
@@ -968,15 +630,10 @@ class GraphGuidedExplorer:
                 and count > self.cart_count_baseline
             ):
                 self.cart_delta_verified = True
-            # Authoritative product match: OUR ASIN is present in the cart.
             if _asin_in_observation(obs, self.product_asin):
                 self.cart_product_verified = True
 
     def _infer_graph_scenarios(self) -> None:
-        # Primary path: let the GRAPH infer missed scenarios with a Cypher query
-        # over the Concept nodes (which exist, which were validated). Falls back
-        # to in-memory rule evaluation only when Neo4j is unavailable, so the
-        # reasoning is genuinely graph-driven whenever a graph is present.
         candidates = self._infer_from_graph()
         if candidates is None:
             candidates = self._infer_in_memory()
@@ -999,30 +656,7 @@ class GraphGuidedExplorer:
             for r in rows
         ]
 
-    async def _verify_cart_mutation(self, pre: tuple) -> tuple[bool, PageObservation, list[str]]:
-        """Re-read the canonical cart and confirm a real item-count/subtotal delta.
-
-        Returns (changed, post_observation, evidence). This is the authoritative
-        check for quantity changes, independent of browser-use's flaky SPA view.
-        """
-        pre_count, pre_sub = pre
-        post = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart state after quantity change")
-        post_obs = post.observation
-        post_count, post_sub = _cart_item_count(post_obs), _cart_subtotal(post_obs)
-        changed = bool(
-            (pre_count is not None and post_count is not None and post_count != pre_count)
-            or (pre_sub and post_sub and pre_sub != post_sub)
-        )
-        ev = [f"cart_count {pre_count}->{post_count}", f"subtotal {pre_sub}->{post_sub}", f"verified_change={changed}"]
-        return changed, post_obs, ev
-
     async def _restore_product_to_cart(self) -> PageObservation:
-        """Re-add the product after a destructive/save test emptied the cart.
-
-        Removing the item was already verified; re-adding it lets the end-to-end
-        flow still reach checkout and demonstrates a full add -> remove -> verify
-        -> re-add loop. Capped so a failed re-add can never loop forever.
-        """
         if self.restores_done >= 3:
             back = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart (restore capped)")
             return back.observation
@@ -1034,46 +668,21 @@ class GraphGuidedExplorer:
         res = await self.executor.execute_intent(ni)
         ok = res.status in {"validated", "clicked_observed", "already_satisfied"}
         self._event(
-            "replay", "Restore product to cart", res.observation.state,
-            "restored" if ok else res.status, SOURCE_CRAWLER,
+            "replay",
+            "Restore product to cart",
+            res.observation.state,
+            "restored" if ok else res.status,
+            SOURCE_CRAWLER,
             ["re-added the product after a destructive/save test so checkout can still complete"],
         )
         back = await self.executor.navigate_and_observe(self.cart_url, expected_state=STATE_CART, label="Cart after restore")
         return back.observation
 
-    def _graph_driven_intents(self, state: str) -> list[NormalizedIntent]:
-        """Turn graph-inferred missed scenarios into executable frontier intents.
-
-        For each inferred-missed scenario whose pivot is an action valid in the
-        current state and not yet completed, emit a SOURCE_GRAPH intent. The
-        frontier's risk gates still decide whether it is clicked or observed, so
-        this only ever ADDS coverage, never bypasses safety.
-        """
-        candidates = self._infer_from_graph()
-        if candidates is None:
-            candidates = self._infer_in_memory()
-        out: list[NormalizedIntent] = []
-        for s in candidates:
-            rule = _RULE_BY_KEY.get(s["key"])
-            pivot = rule.get("pivot") if rule else None
-            if not pivot:
-                continue
-            if self.frontier.is_completed(pivot):
-                continue
-            spec = INTENTS.get(pivot)
-            if not spec or state not in spec.expected_states:
-                continue
-            ni = self.normalizer._from_spec(spec, SOURCE_GRAPH, None, 0.82, 0.82, 0.0, f"graph inference: {s['key']}")
-            ni.expected_state = state
-            out.append(ni)
-        return out
-
     def _infer_in_memory(self) -> list[dict[str, Any]]:
-        """Deterministic fallback mirroring the graph rules (no Neo4j needed)."""
         return infer_missed_in_memory(self.observed_concepts, self._validated_concepts(), INFERENCE_RULES)
 
     def _validated_concepts(self) -> set[str]:
-        return {rec.canonical_key for rec in self.frontier.canonical_success.values()}
+        return set(self.crawl_validated_concepts)
 
     def _run_assertions(self) -> dict[str, Any]:
         end_to_end = bool(self.add_to_cart_validated and (self.cart_delta_verified or self.cart_product_verified) and self.proceed_to_checkout_validated)
@@ -1097,9 +706,17 @@ class GraphGuidedExplorer:
 
     def _living_graph_section(self) -> dict[str, Any]:
         seen = self.graph.observed_keys(self.scope) | self.observed_concepts
-        expected = ["action.add_to_cart", "action.go_to_cart", "action.proceed_to_checkout", "domain.quantity_control", "domain.subtotal", "action.delete_item", "action.save_for_later", "domain.checkout_boundary", "domain.final_order_boundary"]
-        # Prefer the graph's own notion of absence (expected Concept never
-        # validated); fall back to the local seen-set diff when Neo4j is off.
+        expected = [
+            "action.add_to_cart",
+            "action.go_to_cart",
+            "action.proceed_to_checkout",
+            "domain.quantity_control",
+            "domain.subtotal",
+            "action.delete_item",
+            "action.save_for_later",
+            "domain.checkout_boundary",
+            "domain.final_order_boundary",
+        ]
         missing = []
         if self.graph.enabled:
             try:
@@ -1113,56 +730,30 @@ class GraphGuidedExplorer:
         for key in missing[:5]:
             spec = INTENTS.get(key)
             if spec:
-                recs.append({"canonical_key": key, "human_label": spec.human_label, "expected_state": spec.expected_states[0] if spec.expected_states else "unknown", "reason": f"{key} is expected but not yet observed/validated in this scoped graph."})
-        return {
-            "stable": max(0, len(seen) - len(missing)),
-            "missing": missing,
-            "recommended_retests": recs,
-            "neighbor_llm_calls": self.neighbor_generator.total_llm_calls,
-            "neighbor_fallback_calls": self.neighbor_generator.total_fallback_calls,
-        }
+                recs.append({
+                    "canonical_key": key,
+                    "human_label": spec.human_label,
+                    "expected_state": spec.expected_states[0] if spec.expected_states else "unknown",
+                    "reason": f"{key} is expected but not yet observed/validated in this scoped graph.",
+                })
+        return {"stable": max(0, len(seen) - len(missing)), "missing": missing, "recommended_retests": recs}
 
     def _event(self, kind: str, label: str, state: str, status: str, source: str, evidence: list[str]) -> None:
         self.events.append(ExplorationEvent(len(self.events) + 1, kind, label, state, status, source, evidence))
         if self.debug:
-            # quiet mode: only print important events (clicked, blocked, key transitions)
-            quiet_skip = {"found", "observed", "frontier", "replay"}
+            quiet_skip = {"found", "observed", "replay"}
             if kind.lower() not in quiet_skip:
-                print(f"[dfs][event] {kind.upper()} {label} state={state} status={status} source={source} evidence={evidence[:3]}")
-
-
-def _looks_like_dom_line(line: str) -> bool:
-    """True for browser-use DOM-representation lines that are not human text.
-
-    The browser-use ``llm_representation`` text contains markup such as
-    ``[4631]<a id=nav-global-location-popover-link role=button />`` which must
-    not be captured as a product title.
-    """
-    s = line.strip()
-    if not s:
-        return True
-    if "<" in s or ">" in s:
-        return True
-    if s.startswith("[") and "]" in s[:8]:
-        return True
-    low = s.lower()
-    return any(tok in low for tok in ("id=", "role=", "href=", "aria-label=", "class=", "selector=", "xpath="))
+                actor = "graph" if source == SOURCE_GRAPH else "crawler"
+                print(f"[event][{actor}] {kind.upper()} {label} state={state} status={status} evidence={evidence[:3]}")
 
 
 def _asin_from_url(url: str) -> str:
-    """Extract the Amazon ASIN (stable product id) from a product URL."""
     m = re.search(r"/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})", url or "")
     return m.group(1) if m else ""
 
 
-# Ingestion-only labeling: map a free-form action label that the autonomous crawl
-# clicked into a canonical feature concept, so the graph can reason over what was
-# done. This is deterministic *labeling* (ingestion), not catalogue-driven
-# discovery — the crawl already chose the action; we only record what it touched.
 _ACTION_CONCEPT_MAP = (
     ("save for later", "action.save_for_later"),
-    ("add to list", "action.save_for_later"),
-    ("add to wish", "action.save_for_later"),
     ("move to cart", "action.move_to_cart"),
     ("decrease quantity", "action.change_quantity"),
     ("increase quantity", "action.change_quantity"),
@@ -1182,6 +773,9 @@ _ACTION_CONCEPT_MAP = (
 )
 
 
+_RULE_BY_KEY: dict[str, dict] = {r["key"]: r for r in INFERENCE_RULES}
+
+
 def _action_to_concept(label: str) -> str | None:
     low = (label or "").lower()
     for kw, concept in _ACTION_CONCEPT_MAP:
@@ -1190,25 +784,36 @@ def _action_to_concept(label: str) -> str | None:
     return None
 
 
-def _checkout_reached_ok(after_state: str, after_url: str, error: str) -> bool:
-    """True when Proceed to Checkout reached the prototype boundary.
+def _probe_key(proposal: dict, round_no: int, index: int) -> str:
+    raw = proposal.get("concept") or proposal.get("title") or f"probe_{index}"
+    slug = re.sub(r"[^a-z0-9]+", "_", str(raw).lower()).strip("_")[:48] or f"probe_{index}"
+    return f"probe_r{round_no}_{index}_{slug}"
 
-    For this take-home prototype, checkout is the terminal boundary. Amazon may
-    redirect to sign-in before showing address/payment; that still proves the
-    checkout boundary was reached. Wrong-target clicks are still not accepted.
-    """
+
+def _extract_veto_reason(error: str) -> str:
+    if "safety_veto:" not in (error or ""):
+        return ""
+    return (error.split("safety_veto:", 1)[1].split(";", 1)[0].split("|", 1)[0]).strip()[:120]
+
+
+def _action_repeat_key(label: str) -> str:
+    low = re.sub(r"\s+", " ", (label or "").strip().lower())
+    if not low:
+        return ""
+    if any(t in low for t in ("coupon", "promo", "voucher", "gift card", "claim code")):
+        return "cart:promo_code"
+    low = re.sub(r"\b\d+(?:\.\d+)?\b", "<num>", low)
+    return low[:120]
+
+
+def _checkout_reached_ok(after_state: str, after_url: str, error: str) -> bool:
     err_low = (error or "").lower()
-    reached = after_state in {STATE_CHECKOUT, "final_order_boundary"}
+    reached = after_state in {STATE_CHECKOUT, "final_order_boundary"} or "checkout" in (after_url or "").lower()
     wrong_target = "wrong_target_for_checkout" in err_low
     return reached and not wrong_target
 
 
 def _cart_url_for(product_url: str) -> str:
-    """Cart URL on the SAME Amazon marketplace/domain as the product URL.
-
-    amazon.in product -> amazon.in cart, amazon.co.uk -> amazon.co.uk, etc.
-    Falls back to amazon.com if the host can't be parsed.
-    """
     try:
         p = urlparse(product_url)
         if p.scheme and p.netloc:
@@ -1222,16 +827,7 @@ def _clean_name(name: str) -> str:
     return html.unescape(name or "").strip()
 
 
-_RULE_BY_KEY: dict[str, dict] = {r["key"]: r for r in INFERENCE_RULES}
-
-
 def infer_missed_in_memory(observed_concepts: set[str], validated_concepts: set[str], rules: list[dict]) -> list[dict]:
-    """Pure mirror of the graph inference query (used when Neo4j is unavailable).
-
-    A scenario is MISSED when every prerequisite concept was observed but the
-    pivot action that would prove the behaviour was never validated.
-    """
-    from ..domain.checkout_contract import SOURCE_GRAPH as _SG
     out = []
     for rule in rules:
         if not set(rule["requires"]) <= observed_concepts:
@@ -1239,18 +835,16 @@ def infer_missed_in_memory(observed_concepts: set[str], validated_concepts: set[
         pivot = rule.get("pivot")
         if pivot is None or pivot not in validated_concepts:
             out.append({
-                "key": rule["key"], "title": rule["title"], "status": rule["status"],
-                "depends_on": list(rule["requires"]), "source": _SG,
+                "key": rule["key"],
+                "title": rule["title"],
+                "status": rule["status"],
+                "depends_on": list(rule["requires"]),
+                "source": SOURCE_GRAPH,
             })
     return out
 
 
 def _asin_in_observation(obs, asin: str) -> bool:
-    """True when OUR ASIN appears in the observation (text or element hrefs).
-
-    Recommendation links carry different ASINs, so this stays specific to the
-    product under test.
-    """
     if not asin:
         return False
     a = asin.lower()
@@ -1263,18 +857,10 @@ def _asin_in_observation(obs, asin: str) -> bool:
 
 
 def _title_near_asin(obs, asin: str) -> str:
-    """Product name taken from the alt text adjacent to OUR ASIN.
-
-    Anchoring on the ASIN avoids picking the longest recommendation alt on the
-    page. Falls back to Amazon's productTitle element when present.
-    """
     text = obs.text or ""
     if asin:
         idx = text.find(asin)
         if idx >= 0:
-            # Pick the alt text physically CLOSEST to our ASIN link — the item's
-            # own image — not the longest alt on the page (a recommendation could
-            # be longer but sits far from our ASIN).
             best, best_dist = "", 10 ** 9
             for m in re.finditer(r"alt=([^/\n>]+?)(?:\s*/?>|\n)", text):
                 a = m.group(1).strip()
@@ -1292,19 +878,11 @@ def _title_near_asin(obs, asin: str) -> str:
 
 
 def _cart_item_count(obs) -> int | None:
-    """Parse the nav cart count (``aria-label=N items in cart``)."""
     m = re.search(r"(\d+)\s+items?\s+in\s+cart", (obs.text or "").lower())
     return int(m.group(1)) if m else None
 
 
 def _cart_subtotal(obs) -> str | None:
-    """Parse the cart subtotal amount as a normalized numeric string.
-
-    Currency-agnostic: handles "Subtotal (2 items): INR 2,467.73", "$13.08", etc.
-    Returns the digits ("2467.73") for stable equality comparison, or None.
-    """
-    # Require a money-shaped value (two decimals) so "(2 items)" is not mistaken
-    # for the amount. Non-greedy skip jumps over "(N items): INR " etc.
     m = re.search(r"subtotal[^\n]{0,40}?([0-9][0-9.,]*\.\d{2})", (obs.text or "").lower())
     if not m:
         return None

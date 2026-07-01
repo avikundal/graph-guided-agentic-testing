@@ -241,6 +241,44 @@ INFERENCE_RULES: list[dict] = [
     },
 ]
 
+CAUSAL_EXPECTATIONS: list[dict] = [
+    {
+        "key": "cause.quantity_updates_subtotal",
+        "title": "Changing quantity should update subtotal or cart totals",
+        "cause": "action.change_quantity",
+        "effect": "domain.subtotal",
+        "state": STATE_CART,
+    },
+    {
+        "key": "cause.delete_updates_cart_item",
+        "title": "Deleting an item should update cart contents",
+        "cause": "action.delete_item",
+        "effect": "domain.cart_item",
+        "state": STATE_CART,
+    },
+    {
+        "key": "cause.save_for_later_updates_cart_item",
+        "title": "Saving for later should move the item out of the active cart",
+        "cause": "action.save_for_later",
+        "effect": "domain.cart_item",
+        "state": STATE_CART,
+    },
+    {
+        "key": "cause.promo_code_updates_total_or_error",
+        "title": "Applying a promo code should change totals or show a result",
+        "cause": "capability.promo_code",
+        "effect": "domain.subtotal",
+        "state": STATE_CART,
+    },
+    {
+        "key": "cause.checkout_reaches_boundary",
+        "title": "Proceeding to checkout should reach the checkout boundary",
+        "cause": "action.proceed_to_checkout",
+        "effect": "domain.checkout_boundary",
+        "state": STATE_CART,
+    },
+]
+
 # The full feature contract — every Concept that SHOULD exist for this feature.
 # Seeding these as expected=true lets absence ("what should exist but doesn't")
 # be a queryable graph property rather than a Python set-difference.

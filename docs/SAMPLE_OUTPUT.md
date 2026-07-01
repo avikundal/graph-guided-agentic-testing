@@ -71,10 +71,10 @@ of what was observed.
 
 Take **"deleting an item should update the subtotal."**
 
-The agent *saw* the delete button and *saw* the subtotal — but it never clicked
-delete, because deleting is destructive and I keep destructive actions in
-observe-only mode by default. So a pure crawler would just move on, and that
-behaviour would go untested forever.
+The agent can now click destructive cart controls under the deny-list safety
+envelope, verify the cart/subtotal change, and restore the product so checkout can
+still complete. The graph still matters because it can notice controls or effects
+the free crawler saw but did not actually prove.
 
 The graph doesn't move on. It reasons: *I have a cart item, a delete control, and a
 subtotal all present, but I've never actually proven that deleting changes the
@@ -83,10 +83,9 @@ graph surfaces it as `INFERRED_MISSED`. This is precisely the difference between
 "a crawler with a database" and the system the brief is asking for.
 
 And here's the part I'm happiest about: the graph doesn't just *report* the gap, it
-**acts on it**. For "changing quantity should recalculate subtotal," the graph
-pushed that action back onto the agent's to-do list (you'll see `source=graph_inferred`
-in the run), the agent went and did it, and it got validated. The graph literally
-made the crawler test something it would otherwise have skipped.
+**acts on it**. It surfaces a missed scenario, sends browser-use a targeted probe
+on the right page, and the report attributes the resulting click back to
+`source=graph_inferred` when it fulfills that surfaced concept.
 
 ## 4. The "graph impact" summary (printed at the end of every run)
 

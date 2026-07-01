@@ -1,4 +1,4 @@
-from src.explorer.browser_use_executor import _safe_intent_id, _safe_prompt_list, _looks_like_internal_action_url, BrowserUseIntentExecutor
+from src.explorer.browser_use_executor import _repeat_key, _safe_intent_id, _safe_prompt_list, _looks_like_internal_action_url, BrowserUseIntentExecutor
 from src.explorer.semantic_normalizer import SemanticNormalizer
 from src.domain.checkout_contract import INTENTS, SOURCE_DOMAIN
 
@@ -19,6 +19,13 @@ def test_internal_action_url_guard():
     assert _looks_like_internal_action_url('https://action.proceed/')
     assert _looks_like_internal_action_url('https://domain.final/')
     assert not _looks_like_internal_action_url('https://www.amazon.com/gp/cart/view.html')
+
+
+def test_coupon_values_share_one_repeat_key():
+    assert _repeat_key("text=VALIDCOUPON123") == "cart:promo_code"
+    assert _repeat_key("text=INVALIDCOUPON123") == "cart:promo_code"
+    assert _repeat_key("Apply coupon") == "cart:promo_code"
+    assert _repeat_key("text=10") == "text=10"
 
 
 def test_intent_task_does_not_include_dotted_canonical_key_or_fake_url_seed():

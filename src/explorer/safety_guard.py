@@ -6,11 +6,10 @@ allow-list would block every newly-discovered intent and defeat that purpose. So
 safety is a *deny-list*: default-allow, and block only a short list of known-bad
 actions before they execute.
 
-Two things are blocked, and only two:
-  1. Final payment — irreversible, so double-guarded by button text AND by the
-     order-placement URL. This is the one line that must never be crossed.
-  2. Off-product navigation — leaving to a *different* product or an external
-     site. (A "stay on task" guard, not a money guard.)
+The veto is deliberately short, but the cart page gets one extra boundary: only
+cart controls are actionable there. Recommendation rails can create effectively
+infinite labels, so cart-page product tiles/sponsored links are blocked
+before they can burn tokens or add unrelated items.
 
 The veto runs in the browser-use step callback, which fires after the LLM picks
 an action but BEFORE it executes, so raising ``ForbiddenActionVeto`` prevents the
@@ -45,6 +44,19 @@ _ORDER_URL_PATTERNS = (
 # Session-destroying account actions. Not payment, but they log the run out and
 # derail everything — a known-bad action worth a deny-list entry.
 _SESSION_TERMS = ("sign out", "signout", "log out", "logout", "switch account", "switch accounts")
+_ACCOUNT_LIST_TERMS = ("wish list", "wishlist", "add to wish", "add to list")
+
+_CART_CONTROL_TERMS = (
+    "quantity", "increase", "decrease", "delete", "remove", "save for later",
+    "move to cart", "coupon", "promo", "gift", "apply", "proceed", "checkout",
+    "go to cart", "view cart", "open cart", "rating", "ratings", "review",
+    "reviews", "stars", "out of 5",
+)
+
+_CART_JUNK_TERMS = (
+    "sponsored", "recommended", "recommendation", "customers also", "similar item",
+    "related item", "frequently bought", "buy again", "carousel", "see more", "view item",
+)
 
 # Navigation-style actions whose destination URL we can inspect before it runs.
 _NAV_ACTIONS = {"navigate", "go_to_url", "open_tab", "new_tab"}
@@ -82,6 +94,25 @@ def is_other_product_label(label: str, brand_tokens) -> bool:
     return not (toks & set(brand_tokens))
 
 
+def is_cart_relevant_action(label: str) -> bool:
+    """Cart crawl is bounded: only controls that mutate/validate this cart count.
+
+    Amazon cart pages include endless recommendation product labels. Treating all
+    visible labels as "new actions" makes no-repeat chase junk forever.
+    """
+    text = (label or "").lower()
+    return any(t in text for t in _CART_CONTROL_TERMS)
+
+
+def is_cart_junk_action(label: str) -> bool:
+    text = (label or "").lower()
+    if any(t in text for t in _CART_JUNK_TERMS):
+        return True
+    if ("add to cart" in text or "add to basket" in text) and any(t in text for t in ("sponsored", "recommended", "stars", "rating", "review")):
+        return True
+    return False
+
+
 def asin_from_url(url: str) -> str:
     m = _ASIN_RE.search(url or "")
     return m.group(1).upper() if m else ""
@@ -115,20 +146,30 @@ def veto_reason(
     # 1c) Session-destroying account actions (sign out / switch account).
     if any(t in text for t in _SESSION_TERMS):
         return f"session:{text[:30]}"
+    # Wishlist / account-list actions are not cart save-for-later. They often
+    # trigger sign-in and derail the checkout/cart run.
+    if action_type in {"click", "select", "fill"} and any(t in text for t in _ACCOUNT_LIST_TERMS):
+        return f"account_list:{text[:40]}"
 
     # 2a) Off-product CART action — the agent wandered onto a recommendation /
     #     cross-sell for a DIFFERENT product. Blocking this is the user's own
     #     boundary ("only the product under test").
-    if action_type in {"click", "select"} and is_other_product_label(text, product_title_tokens):
+    if action_type in {"click", "select", "fill"} and is_other_product_label(text, product_title_tokens):
         return "off_product:other_item"
 
     # 2b) Adding ANOTHER product from the CART page (recommendation / cross-sell,
     #     same brand or not). On the product page 'add to cart' is the item under
     #     test; on the cart page it is always a different item being added.
-    if action_type in {"click", "select"} and page_state == STATE_CART and (
+    if action_type in {"click", "select", "fill"} and page_state == STATE_CART and (
         "add to cart" in text or "add to basket" in text
     ):
         return "off_product:cart_recommendation_add"
+
+    # 2c) Cart-page action surface bound. Raw cart pages include infinite
+    # recommendation/tile/review labels; these are not cart controls.
+    if action_type in {"click", "select", "fill"} and page_state == STATE_CART:
+        if is_cart_junk_action(text) or not is_cart_relevant_action(text):
+            return "cart_scope:irrelevant_action"
 
     # 2) Off-product navigation (navigation-style actions whose URL we can read).
     if action_type in _NAV_ACTIONS and url.startswith("http"):

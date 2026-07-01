@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -104,14 +106,31 @@ class PageObserver:
     """
 
     async def observe(self, page: Any) -> PageObservation:
-        await page.wait_for_timeout(900)
-        url = page.url
+        wait = getattr(page, "wait_for_timeout", None)
+        if callable(wait):
+            await wait(900)
+        else:
+            await asyncio.sleep(0.9)
+        if hasattr(page, "url"):
+            url = page.url
+        else:
+            get_url = getattr(page, "get_url", None)
+            url = await get_url() if callable(get_url) else ""
         try:
-            title = await page.title()
+            if hasattr(page, "title"):
+                title_attr = page.title
+                title = await title_attr() if callable(title_attr) else str(title_attr or "")
+            else:
+                get_title = getattr(page, "get_title", None)
+                title = await get_title() if callable(get_title) else ""
         except Exception:
             title = ""
         try:
-            text = (await page.inner_text("body", timeout=7000))[:24000]
+            inner_text = getattr(page, "inner_text", None)
+            if callable(inner_text):
+                text = (await inner_text("body", timeout=7000))[:24000]
+            else:
+                text = (await page.evaluate("() => document.body ? document.body.innerText : ''"))[:24000]
         except Exception:
             text = ""
         elements = await self._extract_elements(page)
@@ -402,6 +421,11 @@ class PageObserver:
         }
         """
         raw = await page.evaluate(script)
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = []
         return [UIElement(**r) for r in raw]
 
 

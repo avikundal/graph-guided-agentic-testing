@@ -18,28 +18,27 @@ The graph is the mirror image. It's hopeless at clicking anything, but it's
 perfect at structure and memory: it can hold "here is everything we've ever seen
 about checkout" and reason over it.
 
-So the entire design is just: **let the LLM do the messy perception and clicking,
-and let plain deterministic code do the planning, the safety, the validation, and
-the reasoning.** Once I committed to that split, most of the hard questions answered
-themselves.
+So the current design is: **let browser-use do the messy exploration and clicking,
+then let the graph reason over what was observed, proven, and still missing.**
+Deterministic code still owns the hard veto, provenance, graph writes, and the
+post-action checks that decide what becomes trusted.
 
 ## Who does what
 
 There's no single big "agent." There's a conductor and a handful of small,
 single-purpose pieces, each with a boundary it isn't allowed to cross:
 
-- **The planner** (the DFS frontier) decides what to test next. It never clicks
-  anything — it just keeps an ordered to-do list and hands one item at a time to
-  the executor.
-- **The executor** (the browser-use wrapper) performs exactly one UI action and
-  reports back. It's deliberately thin and dumb: it gets one instruction, does it,
-  and stops. It never writes to the graph.
+- **The crawler** (browser-use) explores freely inside a deterministic safety
+  envelope. It chooses the controls to try, but the deny-list veto can stop unsafe,
+  repeated, off-product, account, or payment actions before execution.
 - **The observer** turns a raw web page into typed facts — what state we're in, what
   controls are visible, what concepts are present.
 - **The validator** is the skeptic. Before anything is allowed to count as
   "validated," it re-checks from independent evidence. The executor saying "done"
   is just a rumour until the validator confirms it.
-- **The reasoner** is the Cypher query that finds missed and absent scenarios.
+- **The reasoner** is the Cypher/fallback rule layer plus the graph-expansion LLM
+  that turns seen-but-unverified and expected-but-absent concepts into targeted
+  probes after crawl convergence.
 - **The graph store** does all the Neo4j reads and writes.
 
 The boundary I care about most is between the executor and the validator. The
@@ -104,14 +103,14 @@ behaviour." The query then asks the graph: for each rule, were all the prerequis
 concepts actually observed, but the proving action never validated? If so, that's a
 missed scenario.
 
-Because this is a deterministic database query and not the LLM, it can't make things
-up. The only way it can be wrong is if a *rule* is wrong — which is a much smaller,
-more controllable surface than trusting a model to invent scenarios on the fly. (In
-Part B I talk about how you'd evaluate and promote those rules at scale.)
+The rule path is deterministic; the graph-expansion LLM is deliberately a second
+pass after the free crawl has stopped finding new action-level evidence. Its output
+is treated as probe instructions, not ground truth.
 
-And the loop closes: the actionable missed scenarios get pushed back onto the
-planner's to-do list, so the agent actually goes and runs them. The graph isn't a
-report you read at the end — it steers the next thing the crawler does.
+And the loop closes: actionable missed scenarios are grouped by the page where
+their concept belongs, browser-use is navigated there, and the graph-directed probe
+is executed with attribution back to the graph. The graph isn't a report you read
+at the end — it steers the second pass.
 
 ## Where this is honestly still a prototype
 

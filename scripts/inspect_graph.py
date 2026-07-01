@@ -96,6 +96,42 @@ def main():
         """, params):
             print(f" - {r['title']} [{r['status']}] source={r['source']}")
 
+        print("\nGraph probes:")
+        for r in s.run("""
+            MATCH (p:GraphProbe {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key})
+            WHERE $run_id IS NULL OR p.run_id=$run_id
+            OPTIONAL MATCH (p)-[:PROBES]->(c:Concept)
+            RETURN p.key AS key, p.title AS title, p.status AS status,
+                   p.target_state AS target_state, collect(DISTINCT c.key) AS concepts
+            ORDER BY p.round_no, p.key
+        """, params):
+            print(f" - {r['key']}: {r['title']} [{r['status']}] state={r['target_state']} concepts={r['concepts']}")
+
+        print("\nAction attempts:")
+        for r in s.run("""
+            MATCH (a:ActionAttempt {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key})
+            WHERE $run_id IS NULL OR a.run_id=$run_id
+            OPTIONAL MATCH (a)-[:TARGETS]->(c:Concept)
+            RETURN a.step AS step, a.source AS source, a.action_type AS action_type,
+                   a.target_label AS target_label, a.status AS status,
+                   a.page_state_before AS before_state, a.page_state_after AS after_state,
+                   collect(DISTINCT c.key) AS concepts
+            ORDER BY a.step LIMIT 80
+        """, params):
+            print(
+                f" - {r['step']}: [{r['source']}] {r['action_type']} {r['target_label']} "
+                f"{r['before_state']}->{r['after_state']} status={r['status']} concepts={r['concepts']}"
+            )
+
+        print("\nCausal expectations:")
+        for r in s.run("""
+            MATCH (ce:CausalExpectation {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key})
+            RETURN ce.key AS key, ce.title AS title, ce.cause AS cause,
+                   ce.effect AS effect, ce.state AS state
+            ORDER BY ce.key
+        """, params):
+            print(f" - {r['key']}: {r['cause']} SHOULD_CAUSE {r['effect']} on {r['state']} - {r['title']}")
+
         print("\nRun assertions:")
         for r in s.run("""
             MATCH (run:Run {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key})

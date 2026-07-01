@@ -85,6 +85,12 @@ def test_blocks_session_destroying_actions():
     assert _veto(target="Add to cart") is None   # still allowed
 
 
+def test_blocks_wishlist_account_actions():
+    assert _veto(target="Add to Wish List")
+    assert _veto(target="Add to list")
+    assert _veto(target="Save for later") is None
+
+
 def test_blocks_cart_action_on_a_different_product():
     from src.explorer.safety_guard import product_tokens, is_other_product_label
     tt = product_tokens("Allen Solly Men's Casual Polo Shirt")
@@ -108,3 +114,28 @@ def test_blocks_adding_other_product_from_cart_page():
     r2 = veto_reason(target_label="Add to cart", action_url="", action_type="click",
                      product_asin=PROD_ASIN, base_host=BASE_HOST, page_state="product_detail")
     assert r2 is None
+
+
+def test_cart_page_blocks_recommendation_junk_but_allows_cart_controls():
+    from src.explorer.safety_guard import veto_reason
+
+    for label in [
+        "Sponsored product tile Van Heusen Solid Polo",
+        "See more similar items",
+    ]:
+        r = veto_reason(target_label=label, action_url="", action_type="click",
+                        product_asin=PROD_ASIN, base_host=BASE_HOST, page_state="shopping_cart")
+        assert r == "cart_scope:irrelevant_action"
+
+    for label in [
+        "Increase quantity",
+        "Delete item",
+        "Save for later",
+        "Apply coupon",
+        "Proceed to checkout",
+        "Go to Cart",
+        "4.3 out of 5 stars, 2,391 ratings",
+        "Customer reviews",
+    ]:
+        assert veto_reason(target_label=label, action_url="", action_type="click",
+                           product_asin=PROD_ASIN, base_host=BASE_HOST, page_state="shopping_cart") is None

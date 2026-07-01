@@ -1,9 +1,9 @@
-"""Engine 2 — LLM-over-graph: find what the autonomous crawl missed.
+"""Engine 2 - LLM-over-graph: find what the autonomous crawl missed.
 
 The crawl (browser-use, unleashed) discovers what it stumbles into. This module
-is the other half: it reads the knowledge graph — what was discovered and
-validated, what the feature is *expected* to have, and what is expected-but-
-absent — and asks an LLM to reason about the scenarios the crawl likely MISSED.
+is the other half: it reads the knowledge graph - what was discovered and
+validated, what the feature is expected to have, and what is expected-but-
+absent - and asks an LLM to reason about the scenarios the crawl likely MISSED.
 
 This is deliberately the opposite of the crawl: structural, not probabilistic.
 It can propose hidden controls (behind a tab/expander), unverified effects (a
@@ -16,7 +16,7 @@ Deterministic fallback (no LLM key, or a bad response) keeps the loop working.
 from __future__ import annotations
 
 import json
-from typing import Iterable
+from typing import Any, Iterable
 
 from ..config import settings
 
@@ -30,6 +30,7 @@ def expand_from_graph(
     expected_concepts: Iterable[str],
     absent_concepts: Iterable[str],
     visible_affordances: Iterable[str],
+    graph_context: dict | None = None,
     max_items: int = 6,
     debug: bool = False,
 ) -> list[dict]:
@@ -43,14 +44,22 @@ def expand_from_graph(
     expected = sorted(set(expected_concepts))
     absent = sorted(set(absent_concepts))
     seen_not_validated = [c for c in observed if c not in set(validated)]
+    graph_context = graph_context or {}
+
+    # A graph containing only seeded expectations is not evidence. If the crawl
+    # never grounded a page or recorded an action, LLM expansion just invents a
+    # shopping flow from the contract and wastes browser-use calls.
+    if not observed and not (graph_context.get("action_attempts") or []):
+        if debug:
+            print("[engine2][llm] graph has no observed concepts/actions - skipping expansion")
+        return []
 
     proposals = _llm_expand(
         feature, state, observed, validated, expected, absent,
-        list(visible_affordances)[:30], seen_not_validated, max_items, debug,
+        list(visible_affordances)[:30], seen_not_validated, graph_context, max_items, debug,
     )
     if not proposals:
         proposals = _fallback_expand(seen_not_validated, absent, max_items)
-    # De-dupe by title, clamp.
     out: list[dict] = []
     seen_titles: set[str] = set()
     for p in proposals:
@@ -69,8 +78,6 @@ def expand_from_graph(
     return out
 
 
-# Curated edge-case scenarios a happy-path crawl skips — used by the deterministic
-# fallback so it proposes real missed behaviours, not passive concept names.
 _EDGE_SCENARIOS = {
     "action.delete_item": (
         "Removing the last item should empty the cart and zero the subtotal",
@@ -97,9 +104,6 @@ _EDGE_SCENARIOS = {
 
 
 def _fallback_expand(seen_not_validated: list[str], absent: list[str], max_items: int) -> list[dict]:
-    """Deterministic mirror used when no LLM is available. Proposes real missed
-    behaviours for actionable concepts (skipping passive domain.* concepts, which
-    aren't scenarios to 'test')."""
     out: list[dict] = []
     seen_titles: set[str] = set()
     for c in list(seen_not_validated) + list(absent):
@@ -107,10 +111,12 @@ def _fallback_expand(seen_not_validated: list[str], absent: list[str], max_items
         if not sc:
             if c.startswith("action.") or c.startswith("capability."):
                 name = c.split(".")[-1].replace("_", " ")
-                sc = (f"Exercise '{name}' and verify its effect on the cart",
-                      f"Exercise the {name} control and confirm the cart/subtotal updates.")
+                sc = (
+                    f"Exercise '{name}' and verify its effect on the cart",
+                    f"Exercise the {name} control and confirm the cart/subtotal updates.",
+                )
             else:
-                continue  # passive domain.* concept — not an actionable scenario
+                continue
         if sc[0].lower() in seen_titles:
             continue
         seen_titles.add(sc[0].lower())
@@ -123,34 +129,57 @@ def _fallback_expand(seen_not_validated: list[str], absent: list[str], max_items
     return out[:max_items]
 
 
-def _llm_expand(feature, state, observed, validated, expected, absent, visible, seen_not_validated, max_items, debug=False) -> list[dict]:
+def _llm_expand(feature, state, observed, validated, expected, absent, visible, seen_not_validated, graph_context, max_items, debug=False) -> list[dict]:
     if not settings.openai_api_key:
         if debug:
-            print("[engine2][llm] no OPENAI_API_KEY — using deterministic fallback")
+            print("[engine2][llm] no OPENAI_API_KEY - using deterministic fallback")
         return []
     try:
         from openai import OpenAI
         client = OpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url or None)
+        graph_brief = _format_graph_brief(graph_context, observed, validated, absent, seen_not_validated)
         prompt = f"""
 You are the reasoning layer of an agentic UI-testing system for the "{feature}" feature.
-An autonomous crawler just explored it and recorded what it found in a knowledge graph.
-Your job: find what the crawler MISSED — scenarios that SHOULD be tested but were not.
 
-Current state: {state}
-Concepts the crawler exercised and VALIDATED: {validated}
-Concepts it SAW but did NOT verify the effect of: {seen_not_validated}
-Concepts EXPECTED for this feature (domain knowledge): {expected}
-Expected but NEVER observed this run (possible hidden/missing): {absent}
-Controls visible right now: {visible}
+The crawler just updated a knowledge graph. Your job is NOT to brainstorm from
+general ecommerce knowledge. Your job is to reason over graph RELATIONSHIPS and
+surface only scenarios that buy new graph knowledge.
+
+Current page/state: {state}
+Visible controls right now: {visible}
+
+GRAPH BRIEF
+{graph_brief}
+
+HOW TO REASON OVER THE GRAPH
+1. Follow causal edges first:
+   cause Concept --SHOULD_CAUSE--> effect Concept.
+   If the cause is observed but not validated, or the effect was never observed
+   after an action attempt, propose the action that can prove the edge.
+2. Follow scenario dependencies:
+   Scenario --DEPENDS_ON--> Concept.
+   If all dependency concepts are observed but the pivot/action concept is not
+   validated, propose the missing proving action.
+3. Follow action transitions:
+   before_state --ActionAttempt--> after_state.
+   Prefer actions that caused no meaningful after-state/evidence yet, or actions
+   that should reveal a new state/control but have not.
+4. Follow probe lifecycle:
+   GraphProbe(proposed/executed) --PROBES--> Concept.
+   Do not repeat a probe that is already executed unless the action history shows
+   it failed to test the intended relationship.
+5. Missing expected Concepts matter only when a likely page/state or reveal path
+   exists in the graph. Do not propose random shopping-site features.
 
 Return ONLY a JSON array of up to {max_items} of the most valuable MISSED scenarios.
 Each object: {{"title": str, "why": str, "probe": str, "concept": str|null}}
 - "probe" is a short instruction a browser agent can follow to test it.
 - "concept" is the canonical concept key if one applies, else null.
-Focus on: effects seen-but-unverified; expected-but-absent controls likely hidden
-behind a tab/expander; and edge cases a happy-path crawl skips (empty cart, max
-quantity, invalid coupon, remove the last item, change quantity then re-check
-subtotal). NEVER propose final payment / placing an order.
+- "why" must cite the graph relationship that makes this valuable, for example
+  "action.change_quantity SHOULD_CAUSE domain.subtotal but no validating attempt exists".
+Prioritize causal proof, then unvalidated scenario pivots, then hidden/absent
+controls with graph evidence. Do not repeat already executed graph probes.
+NEVER propose final payment / placing an order.
 """
         resp = client.chat.completions.create(
             model=settings.openai_model,
@@ -167,6 +196,89 @@ subtotal). NEVER propose final payment / placing an order.
             return [d for d in data if isinstance(d, dict)]
     except Exception as exc:
         if debug:
-            print(f"[engine2][llm] call failed ({exc}) — using deterministic fallback")
+            print(f"[engine2][llm] call failed ({exc}) - using deterministic fallback")
         return []
     return []
+
+
+def _format_graph_brief(
+    graph_context: dict[str, Any],
+    observed: list[str],
+    validated: list[str],
+    absent: list[str],
+    seen_not_validated: list[str],
+) -> str:
+    concept_map = {
+        c.get("key"): c
+        for c in graph_context.get("concepts", [])
+        if c.get("key")
+    }
+    lines: list[str] = []
+
+    lines.append("Concept nodes:")
+    focus = sorted(set(observed) | set(validated) | set(absent) | set(seen_not_validated))
+    for key in focus[:40]:
+        c = concept_map.get(key, {})
+        states = ",".join(c.get("states") or []) or "-"
+        lines.append(
+            f"- {key}: expected={_yn(c.get('expected') or key in absent)} "
+            f"observed={_yn(key in observed or c.get('observed'))} "
+            f"validated={_yn(key in validated or c.get('validated'))} "
+            f"states={states} source={c.get('last_source') or '-'}"
+        )
+
+    causal = graph_context.get("causal_expectations") or []
+    if causal:
+        lines.append("Causal edges:")
+        for ce in causal[:20]:
+            cause = ce.get("cause")
+            effect = ce.get("effect")
+            cause_state = _concept_status(concept_map, cause, observed, validated)
+            effect_state = _concept_status(concept_map, effect, observed, validated)
+            lines.append(
+                f"- {cause} --SHOULD_CAUSE--> {effect} on {ce.get('state')}; "
+                f"cause={cause_state}, effect={effect_state}; {ce.get('title')}"
+            )
+
+    scenarios = graph_context.get("scenarios") or []
+    if scenarios:
+        lines.append("Scenario dependency edges:")
+        for sc in scenarios[:20]:
+            deps = ", ".join(sc.get("depends_on") or []) or "-"
+            lines.append(f"- {sc.get('title') or sc.get('key')} [{sc.get('status')}]: DEPENDS_ON {deps}")
+
+    probes = graph_context.get("graph_probes") or []
+    if probes:
+        lines.append("Graph probe lifecycle edges:")
+        for p in probes[-20:]:
+            targets = ", ".join(p.get("probes") or []) or "-"
+            lines.append(f"- {p.get('title')} [{p.get('status')}] on {p.get('target_state')}: PROBES {targets}")
+
+    actions = graph_context.get("action_attempts") or []
+    if actions:
+        lines.append("Recent action transition edges:")
+        for a in actions[-30:]:
+            targets = ", ".join(a.get("targets") or []) or "-"
+            lines.append(
+                f"- {a.get('before_state') or '?'} --{a.get('source')}/{a.get('status')} "
+                f"{a.get('action_type')} '{_trim(a.get('target_label'), 70)}'--> "
+                f"{a.get('after_state') or '?'}; TARGETS {targets}"
+            )
+
+    lines.append(f"Expected-but-absent concepts: {absent}")
+    lines.append(f"Observed-but-not-validated concepts: {seen_not_validated}")
+    return "\n".join(lines)
+
+
+def _concept_status(concept_map: dict[str, dict], key: str | None, observed: list[str], validated: list[str]) -> str:
+    c = concept_map.get(key or "", {})
+    return f"observed={_yn((key in observed) or c.get('observed'))}, validated={_yn((key in validated) or c.get('validated'))}"
+
+
+def _yn(value: Any) -> str:
+    return "Y" if value else "n"
+
+
+def _trim(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit]

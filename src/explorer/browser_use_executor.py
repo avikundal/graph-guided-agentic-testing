@@ -115,11 +115,12 @@ class BrowserUseResult:
 
 
 class BrowserUseIntentExecutor:
-    """Thin browser-use adapter for the DFS/graph explorer.
+    """Thin browser-use adapter for the autonomous graph-guided explorer.
 
     Responsibility split:
-      - DFS/graph decides the next canonical intent.
-      - browser-use executes that narrow intent using its own page model
+      - browser-use freely explores under a hard veto for discovery.
+      - graph-directed probes can ask browser-use to execute a narrow intent
+        using its own page model
         (DOM, accessibility labels, screenshot/layout, internal element indices).
       - this adapter converts browser-use observations back into PageObservation
         and raw step artifacts for graph ingestion.
@@ -136,8 +137,7 @@ class BrowserUseIntentExecutor:
         self._last_artifacts: list[BrowserUseStepArtifact] = []
         self._current_task = "unknown"
         self._task_counter = 0
-        # Phase 2: keep browser-use as an executor, not a planner.
-        # These fields let us detect wandering inside a single narrow intent.
+        # Narrow directed-probe support, used by restore/probe utilities.
         self._active_intent: NormalizedIntent | None = None
         self._task_execution_actions: list[BrowserUseStepArtifact] = []
         self._task_warnings: list[str] = []
@@ -186,7 +186,7 @@ class BrowserUseIntentExecutor:
             api_key=settings.openai_api_key,
             temperature=0.0,
         )
-        self._temp_user_data_dir = tempfile.mkdtemp(prefix="browser-use-dfs-", dir="/tmp")
+        self._temp_user_data_dir = tempfile.mkdtemp(prefix="browser-use-autonomous-", dir="/tmp")
         storage_state_path = _sanitized_storage_state(AUTH_FILE, self._temp_user_data_dir)
         self._browser_session = BrowserSession(
             headless=self.headless,
@@ -241,7 +241,7 @@ Do not navigate to any URL. Do not invent a URL from this prompt text.
         if intent.risk == RISK_OBSERVE_ONLY or intent.risk == RISK_FORBIDDEN_CLICK or not intent.click_allowed:
             return await self.observe_current(label=f"Observe {intent.human_label}", expected_state=intent.expected_state)
         task = self._intent_task(intent)
-        # Phase 2: three steps is enough for one click, one observation/wait, and done.
+        # Three steps is enough for one directed click, one observation/wait, and done.
         # Longer runs let the agent keep planning and wander.
         return await self._run_agent_task(task, label=intent.human_label, start_url=None, max_steps=3, expected_state=intent.expected_state, intent=intent)
 
@@ -394,8 +394,6 @@ Do NOT click again if redirected to sign-in or another page.
                 await agent.run(max_steps=max_steps)
         except Exception as exc:
             error = str(exc)[:300]
-        except Exception as exc:
-            error = str(exc)[:300]
         after = self._last_observation
         if after is None:
             after = PageObservation(
@@ -405,7 +403,8 @@ Do NOT click again if redirected to sign-in or another page.
         # Phase 3: report the primary UI-changing action, not the final `done` action.
         # browser-use usually ends with done(), so using the last artifact made
         # already-satisfied and attempted-click cases hard to classify.
-        primary = self._task_execution_actions[0] if self._task_execution_actions else (self._last_artifacts[-1] if self._last_artifacts else None)
+        ui_actions = [a for a in self._last_artifacts if a.action_type in {"click", "fill", "select"}]
+        primary = self._task_execution_actions[0] if self._task_execution_actions else (ui_actions[0] if ui_actions else (self._last_artifacts[-1] if self._last_artifacts else None))
         action_type = primary.action_type if primary else "observe"
         target = primary.target_label if primary else label
         selector = primary.selector if primary else ""
@@ -419,11 +418,13 @@ Do NOT click again if redirected to sign-in or another page.
         if intent is None:
             # Autonomous exploration burst: no single-intent verdict; just report
             # what was tried and whether the veto fired.
-            evidence = [f"actions={len(self._task_execution_actions)}", f"final_state={after.state}"]
+            evidence = [f"actions={len(ui_actions)}", f"final_state={after.state}"]
             evidence += [f"veto={v}" for v in sorted(set(self._vetoes))[:3]]
+            if error:
+                evidence.append(f"error={error[:160]}")
             if artifact_json:
                 evidence.append(f"artifact_json={artifact_json}")
-            status = "vetoed" if self._vetoes else ("explored" if self._task_execution_actions else "observed")
+            status = "vetoed" if self._vetoes else ("explored" if ui_actions else "observed")
         else:
             evidence = self._evidence_for_result(intent, before, after, target, error)
             if artifact_json:
@@ -461,10 +462,10 @@ Do NOT click again if redirected to sign-in or another page.
 
         # DENY-LIST VETO — runs before the action executes. Only for actions that
         # actually do something (click/select/navigate), using the precise label.
-        if action_type in {"click", "select", "navigate", "go_back", "go_to_url"}:
+        if action_type in {"click", "select", "fill", "navigate", "go_back", "go_to_url"}:
             from .safety_guard import ForbiddenActionVeto, veto_reason
             reason = veto_reason(
-                target_label=el_label if action_type in {"click", "select"} else "",
+                target_label=target if action_type in {"click", "select", "fill"} else "",
                 action_url=_action_url(action),
                 action_type=action_type,
                 product_asin=self._safety_product_asin,
@@ -501,6 +502,8 @@ Do NOT click again if redirected to sign-in or another page.
             evidence=sorted(obs.detected_concepts)[:10],
         )
         self._last_artifacts.append(artifact)
+        if self._active_intent is None and action_type in {"click", "fill", "select"}:
+            self._task_execution_actions.append(artifact)
         if self._active_intent is not None:
             self._track_phase2_contract(artifact)
         if self.debug:
@@ -802,10 +805,15 @@ def _action_type(action: Any) -> str:
 def _repeat_key(label: str) -> str:
     """A stable key for the no-repeat guard, only for identifiable actions. Empty
     for too-short or index-only labels (we can't tell those apart, so don't block).
-    Distinct typed values (COUPON2023 vs INVALID) stay distinct -> not blocked."""
+    Coupon/promo fills are intentionally grouped so different strings do not make
+    the cart crawl chase unlimited promo attempts."""
     s = (label or "").strip().lower()
     if len(s) < 3 or s.startswith("index="):
         return ""
+    if any(tok in s for tok in ("coupon", "promo", "promotion", "voucher")):
+        return "cart:promo_code"
+    if s.startswith("text=") and any(tok in s for tok in ("coupon", "promo", "voucher")):
+        return "cart:promo_code"
     return s[:80]
 
 

@@ -172,6 +172,18 @@ class GraphStore:
         status: str,
         evidence: list[str] | None = None,
     ):
+        validated_statuses = {"validated", "crawl_validated", "graph_directed"}
+        executed_statuses = {"clicked_observed", *validated_statuses}
+        attempted_statuses = {"click_failed", *executed_statuses}
+        observed_statuses = {
+            "observed_only",
+            "destructive_observed_not_clicked",
+            "clicked_observed",
+            "click_failed",
+            "not_executable",
+            "forbidden_blocked",
+            *validated_statuses,
+        }
         params = {
             **scope,
             "run_id": run_id,
@@ -185,19 +197,10 @@ class GraphStore:
             "status": status,
             "selector": intent.selector_candidates[0] if intent.selector_candidates else None,
             "evidence": evidence or [],
-            "observed": status in {
-                "frontier_added",
-                "observed_only",
-                "destructive_observed_not_clicked",
-                "clicked_observed",
-                "validated",
-                "click_failed",
-                "not_executable",
-                "forbidden_blocked",
-            },
-            "attempted": status in {"click_failed", "clicked_observed", "validated"},
-            "executed": status in {"clicked_observed", "validated"},
-            "validated": status == "validated",
+            "observed": status in observed_statuses,
+            "attempted": status in attempted_statuses,
+            "executed": status in executed_statuses,
+            "validated": status in validated_statuses,
         }
         self.write(
             """
@@ -252,6 +255,151 @@ class GraphStore:
             params,
         )
 
+    def write_action_attempt(
+        self,
+        scope: dict,
+        run_id: str,
+        *,
+        action_id: str,
+        step: int,
+        source: str,
+        action_type: str,
+        target_label: str,
+        selector: str,
+        status: str,
+        page_state_before: str,
+        page_state_after: str,
+        url_before: str = "",
+        url_after: str = "",
+        concept: str | None = None,
+        probe_key: str | None = None,
+        evidence: list[str] | None = None,
+        veto_reason: str = "",
+        repeat_key: str = "",
+    ):
+        params = {
+            **scope,
+            "run_id": run_id,
+            "action_id": action_id,
+            "step": step,
+            "source": source,
+            "action_type": action_type,
+            "target_label": target_label,
+            "selector": selector,
+            "status": status,
+            "page_state_before": page_state_before,
+            "page_state_after": page_state_after,
+            "url_before": url_before,
+            "url_after": url_after,
+            "concept": concept,
+            "probe_key": probe_key,
+            "evidence": evidence or [],
+            "veto_reason": veto_reason,
+            "repeat_key": repeat_key,
+        }
+        self.write(
+            """
+            MERGE (r:Run {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, run_id:$run_id})
+            MERGE (a:ActionAttempt {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, run_id:$run_id, action_id:$action_id})
+            SET a.step=$step, a.source=$source, a.action_type=$action_type,
+                a.target_label=$target_label, a.selector=$selector, a.status=$status,
+                a.page_state_before=$page_state_before, a.page_state_after=$page_state_after,
+                a.url_before=$url_before, a.url_after=$url_after,
+                a.veto_reason=$veto_reason, a.repeat_key=$repeat_key,
+                a.evidence=$evidence, a.updated_at=datetime()
+            MERGE (r)-[:HAS_ACTION]->(a)
+            WITH a
+            FOREACH (_ IN CASE WHEN $concept IS NULL THEN [] ELSE [1] END |
+                MERGE (c:Concept {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, key:$concept})
+                MERGE (a)-[:TARGETS]->(c)
+            )
+            WITH a
+            FOREACH (_ IN CASE WHEN $page_state_before = '' THEN [] ELSE [1] END |
+                MERGE (bs:PageState {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, key:$page_state_before})
+                MERGE (a)-[:FROM_STATE]->(bs)
+            )
+            WITH a
+            FOREACH (_ IN CASE WHEN $page_state_after = '' THEN [] ELSE [1] END |
+                MERGE (as:PageState {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, key:$page_state_after})
+                MERGE (a)-[:TO_STATE]->(as)
+            )
+            WITH a
+            FOREACH (_ IN CASE WHEN $probe_key IS NULL THEN [] ELSE [1] END |
+                MERGE (p:GraphProbe {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, run_id:$run_id, key:$probe_key})
+                MERGE (p)-[:TESTED_BY]->(a)
+            )
+            WITH a
+            UNWIND $evidence AS ev
+            WITH a, ev WHERE ev IS NOT NULL AND ev <> ''
+            MERGE (e:Evidence {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, run_id:$run_id, key:ev})
+            SET e.text=ev
+            MERGE (a)-[:HAS_EVIDENCE]->(e)
+            """,
+            params,
+        )
+
+    def write_graph_probe(
+        self,
+        scope: dict,
+        run_id: str,
+        *,
+        key: str,
+        title: str,
+        why: str,
+        instruction: str,
+        concept: str | None,
+        target_state: str,
+        status: str,
+        round_no: int = 0,
+        source: str = "graph_inferred",
+    ):
+        params = {
+            **scope,
+            "run_id": run_id,
+            "key": key,
+            "title": title,
+            "why": why,
+            "instruction": instruction,
+            "concept": concept,
+            "target_state": target_state,
+            "status": status,
+            "round_no": round_no,
+            "source": source,
+        }
+        self.write(
+            """
+            MERGE (r:Run {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, run_id:$run_id})
+            MERGE (p:GraphProbe {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, run_id:$run_id, key:$key})
+            SET p.title=$title, p.why=$why, p.instruction=$instruction,
+                p.concept=$concept, p.target_state=$target_state, p.status=$status,
+                p.round_no=$round_no, p.source=$source, p.updated_at=datetime()
+            MERGE (r)-[:HAS_PROBE]->(p)
+            WITH p
+            FOREACH (_ IN CASE WHEN $concept IS NULL THEN [] ELSE [1] END |
+                MERGE (c:Concept {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, key:$concept})
+                MERGE (p)-[:PROBES]->(c)
+            )
+            """,
+            params,
+        )
+
+    def seed_causal_expectations(self, scope: dict, expectations: list[dict]):
+        params = {**scope, "expectations": expectations}
+        self.write(
+            """
+            UNWIND $expectations AS exp
+            MERGE (ce:CausalExpectation {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, key:exp.key})
+            SET ce.title=exp.title, ce.cause=exp.cause, ce.effect=exp.effect,
+                ce.state=exp.state, ce.expected=true, ce.updated_at=datetime()
+            MERGE (cause:Concept {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, key:exp.cause})
+            MERGE (effect:Concept {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, key:exp.effect})
+            MERGE (cause)-[:SHOULD_CAUSE]->(effect)
+            MERGE (ce)-[:CAUSE_CONCEPT]->(cause)
+            MERGE (ce)-[:EFFECT_CONCEPT]->(effect)
+            """,
+            params,
+        )
+
     def write_run_assertions(self, scope: dict, run_id: str, assertions: dict[str, Any]):
         """Write run-level assertions/provenance as Neo4j-safe primitive properties.
 
@@ -283,6 +431,10 @@ class GraphStore:
             "CREATE CONSTRAINT concept_identity IF NOT EXISTS FOR (c:Concept) REQUIRE (c.tenant_id, c.project_id, c.feature_key, c.key) IS NODE KEY",
             "CREATE CONSTRAINT pagestate_identity IF NOT EXISTS FOR (s:PageState) REQUIRE (s.tenant_id, s.project_id, s.feature_key, s.key) IS NODE KEY",
             "CREATE CONSTRAINT run_identity IF NOT EXISTS FOR (r:Run) REQUIRE (r.tenant_id, r.project_id, r.feature_key, r.run_id) IS NODE KEY",
+            "CREATE CONSTRAINT action_attempt_identity IF NOT EXISTS FOR (a:ActionAttempt) REQUIRE (a.tenant_id, a.project_id, a.feature_key, a.run_id, a.action_id) IS NODE KEY",
+            "CREATE CONSTRAINT graph_probe_identity IF NOT EXISTS FOR (p:GraphProbe) REQUIRE (p.tenant_id, p.project_id, p.feature_key, p.run_id, p.key) IS NODE KEY",
+            "CREATE CONSTRAINT causal_expectation_identity IF NOT EXISTS FOR (ce:CausalExpectation) REQUIRE (ce.tenant_id, ce.project_id, ce.feature_key, ce.key) IS NODE KEY",
+            "CREATE CONSTRAINT evidence_identity IF NOT EXISTS FOR (e:Evidence) REQUIRE (e.tenant_id, e.project_id, e.feature_key, e.run_id, e.key) IS NODE KEY",
         ]
         with self.driver.session(database=settings.neo4j_database) as session:
             for stmt in statements:
@@ -291,7 +443,15 @@ class GraphStore:
                 except Exception:
                     # NODE KEY needs enterprise; fall back to a plain uniqueness/index.
                     try:
-                        label = "Concept" if "Concept" in stmt else "PageState" if "PageState" in stmt else "Run"
+                        label = (
+                            "Concept" if "Concept" in stmt else
+                            "PageState" if "PageState" in stmt else
+                            "ActionAttempt" if "ActionAttempt" in stmt else
+                            "GraphProbe" if "GraphProbe" in stmt else
+                            "CausalExpectation" if "CausalExpectation" in stmt else
+                            "Evidence" if "Evidence" in stmt else
+                            "Run"
+                        )
                         session.run(
                             f"CREATE INDEX {label.lower()}_scope_idx IF NOT EXISTS FOR (n:{label}) ON (n.tenant_id, n.project_id, n.feature_key)"
                         ).consume()
@@ -404,6 +564,89 @@ class GraphStore:
                 params,
             ).data()
         return {"intents": intents, "scenarios": scenarios}
+
+    def graph_view(self, scope: dict) -> dict | None:
+        """Read the CURRENT graph as STRUCTURE for the exploration policy.
+
+        Returns concepts with their observed/validated/expected flags and the
+        states they were seen in (Observation-[:SAW_CONCEPT]->Concept), plus the
+        Scenario-[:DEPENDS_ON]->Concept edges. The LLM policy reasons over these
+        relationships, not over flattened lists.
+        """
+        if not self.driver:
+            return None
+        with self.driver.session(database=settings.neo4j_database) as session:
+            concepts = session.run(
+                """
+                MATCH (c:Concept {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key})
+                OPTIONAL MATCH (o:Observation {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key})-[:SAW_CONCEPT]->(c)
+                WITH c, collect(DISTINCT o.state) AS states
+                RETURN c.key AS key,
+                       coalesce(c.observed,false) AS observed,
+                       coalesce(c.validated,false) AS validated,
+                       coalesce(c.expected,false) AS expected,
+                       c.last_source AS last_source,
+                       [s IN states WHERE s IS NOT NULL] AS states
+                ORDER BY key
+                """,
+                scope,
+            ).data()
+            scenarios = session.run(
+                """
+                MATCH (sc:Scenario {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key})
+                OPTIONAL MATCH (sc)-[:DEPENDS_ON]->(c:Concept)
+                RETURN DISTINCT sc.key AS key, sc.title AS title, sc.status AS status,
+                       sc.source AS source, collect(DISTINCT c.key) AS depends_on
+                ORDER BY key
+                """,
+                scope,
+            ).data()
+            probes = session.run(
+                """
+                MATCH (p:GraphProbe {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key})
+                OPTIONAL MATCH (p)-[:PROBES]->(c:Concept)
+                RETURN p.key AS key, p.title AS title, p.status AS status,
+                       p.target_state AS target_state, p.source AS source,
+                       collect(DISTINCT c.key) AS probes
+                ORDER BY p.round_no, p.key
+                """,
+                scope,
+            ).data()
+            actions = session.run(
+                """
+                MATCH (a:ActionAttempt {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key})
+                OPTIONAL MATCH (a)-[:TARGETS]->(c:Concept)
+                RETURN a.action_id AS action_id, a.step AS step, a.source AS source,
+                       a.action_type AS action_type, a.target_label AS target_label,
+                       a.status AS status, a.page_state_before AS before_state,
+                       a.page_state_after AS after_state, collect(DISTINCT c.key) AS targets
+                ORDER BY a.step, a.action_id
+                LIMIT 80
+                """,
+                scope,
+            ).data()
+            causal = session.run(
+                """
+                MATCH (ce:CausalExpectation {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key})
+                RETURN ce.key AS key, ce.title AS title, ce.cause AS cause,
+                       ce.effect AS effect, ce.state AS state
+                ORDER BY ce.key
+                """,
+                scope,
+            ).data()
+        observed = [c["key"] for c in concepts if c["observed"]]
+        validated = [c["key"] for c in concepts if c["validated"]]
+        return {
+            "concepts": concepts,
+            "scenarios": scenarios,
+            "graph_probes": probes,
+            "action_attempts": actions,
+            "causal_expectations": causal,
+            "observed": observed,
+            "validated": validated,
+            "observed_unverified": [c["key"] for c in concepts if c["observed"] and not c["validated"]],
+            "missing_expected": [c["key"] for c in concepts if c["expected"] and not c["observed"] and not c["validated"]],
+        }
 
     def observed_keys(self, scope: dict) -> set[str]:
         if not self.driver:

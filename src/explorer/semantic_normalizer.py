@@ -61,7 +61,7 @@ class SemanticNormalizer:
             for spec in INTENTS.values():
                 # Hard state gate before grounding: wrong-state candidates can be
                 # useful in debug logs, but they should not enter the executable
-                # frontier or main observed-affordance accounting.
+                # main observed-affordance accounting.
                 if obs.state not in spec.expected_states:
                     continue
                 semantic, selector_quality, reason = self.score_element(spec, el, obs.state)

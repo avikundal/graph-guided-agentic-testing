@@ -26,7 +26,7 @@ spent most of my time.
 | A — how the graph is built | Schema, why I shaped it this way, the reasoning query | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | A — sample output | A real run, annotated: what the agent found, what the graph inferred, and the one scenario the agent **missed** but the graph caught | [docs/SAMPLE_OUTPUT.md](docs/SAMPLE_OUTPUT.md) |
 | A — PR blast radius (the optional stretch) | "If this code changes, which tests are at risk?" | `scripts/pr_blast_radius.py` |
-| **B — the architecture doc** | How this toy becomes real infrastructure for 100+ customers | **[docs/Part_B_Production_Architecture.pdf](docs/Part_B_Production_Architecture.pdf)** (13 pages, with diagrams) |
+| **B — the architecture doc** | How this toy becomes real infrastructure for 100+ customers | **[docs/Part_B_Production_Architecture.md](docs/Part_B_Production_Architecture.md)** |
 
 There's a Loom walkthrough in the submission email too.
 
@@ -46,16 +46,14 @@ exactly the kind of thing I wanted the graph to catch.
 
 When you run it, here's the story that plays out, step by step:
 
-1. **The planner picks one small thing to test.** A deterministic DFS planner keeps
-   a "frontier" of things worth trying next (Add to Cart, Go to Cart, Change
-   Quantity, Proceed to Checkout…). It decides *what* to do. It never touches the
-   browser itself.
-2. **The browser agent does that one thing.** I use [browser-use](https://github.com/browser-use/browser-use)
-   as the hands. It gets a single narrow instruction ("add this item to the cart")
-   plus a strict contract ("do *one* thing, then stop"), and it figures out *how* —
-   which button to click — using the visible page, the accessibility tree, and a
-   screenshot. I deliberately don't hand it brittle CSS selectors; that's the part
-   that rots every time Amazon ships a redesign.
+1. **The crawler explores freely under a hard veto.** I use
+   [browser-use](https://github.com/browser-use/browser-use) as the hands. It can
+   try product options, cart controls, coupon/offer affordances, save-for-later and
+   delete/remove actions, but a deterministic veto blocks final payment, account
+   switches, repeat actions, and leaving the product under test.
+2. **The crawler stops on action-level convergence.** It does not stop just because
+   one canonical concept was seen. It keeps going until no new concepts, no new
+   clicked labels, and no new validated concepts appear across repeated bursts.
 3. **We write down everything it saw.** A "page observer" turns the raw page into
    typed facts — what state are we in (product? cart? checkout?), what controls are
    visible, what concepts exist (a subtotal, a quantity stepper, a delete button).
@@ -64,10 +62,10 @@ When you run it, here's the story that plays out, step by step:
    query looks at the graph and asks: "Have I seen a cart item, a quantity control,
    and a subtotal — but never actually *proven* that changing the quantity moves the
    subtotal?" If so, that's a real test the agent skipped, and the graph surfaces it.
-5. **The graph hands those gaps back to the planner.** The actionable ones get
-   pushed onto the frontier so the crawler goes and runs them — deterministically,
-   without needing the LLM to have thought of them. The graph isn't just a database
-   at the end of the run; it actively steers exploration.
+5. **The graph hands those gaps back as targeted probes.** Browser-use executes
+   those probes on the right page, and the report attributes those clicks to the
+   graph when they fulfill a surfaced concept. The graph isn't just a database at
+   the end of the run; it actively steers the second pass.
 
 The thing I kept reminding myself: **the browser agent is allowed to be wrong.**
 It'll cheerfully tell you "I added it to the cart!" when it actually didn't. So I
@@ -79,10 +77,10 @@ purpose, and it's wired through the whole codebase.
 
 | Job | Who does it | My reasoning |
 |---|---|---|
-| Deciding what to test next, safety, validation | **Plain code** | Safety and reproducibility can't depend on a model's mood. |
-| Finding and clicking the right control | **The LLM (browser-use)** | This is the genuinely hard, fuzzy part — and it survives DOM churn. |
-| Reasoning about missed/absent scenarios | **Plain code (Cypher)** | The graph's value *is* that it's structural. I don't want it hallucinating. |
-| Suggesting nearby extra scenarios | **LLM, with a hardcoded fallback** | Nice-to-have breadth; never load-bearing, so it can fail safely. |
+| Free exploration and fuzzy clicking | **The LLM (browser-use)** | This is the genuinely hard, page-specific part. |
+| Safety veto, provenance, graph writes | **Plain code** | Safety and reproducibility can't depend on a model's mood. |
+| Structural missed-scenario inference | **Plain code (Cypher / fallback rules)** | The graph's value is that it remembers what was observed and proven. |
+| Gap expansion after crawl convergence | **LLM-over-graph, with deterministic fallback** | Used after the crawler exhausts itself, to propose targeted probes. If the LLM is unavailable or returns a bad response, deterministic graph-derived probes keep the loop working. |
 
 ## A few things that were genuinely hard
 
@@ -143,11 +141,11 @@ real browser window once and save the session:
 ### Run a crawl
 
 ```bash
-./.venv/bin/python scripts/crawl_dfs.py \
+./.venv/bin/python scripts/crawl.py \
   --reset-graph --reset-cart \
   --url https://www.amazon.com/dp/0307887898 \
   --tenant-id default --project-id amazon_demo --feature-key amazon_checkout \
-  --max-steps 24 --max-neighbors 5 --enable-living-graph --debug
+  --enable-living-graph --debug
 ```
 
 `--headed` lets you watch the browser do its thing. `--reset-cart` empties the cart
@@ -167,19 +165,19 @@ multi-line version with `\` breaks if your terminal slips a blank line in betwee
 
 ```bash
 # US book
-./.venv/bin/python scripts/crawl_dfs.py --reset-graph --reset-cart --url "https://www.amazon.com/dp/0307887898" --tenant-id default --project-id us_book --feature-key amazon_checkout --max-steps 24 --max-neighbors 5 --enable-living-graph --debug
+./.venv/bin/python scripts/crawl.py --reset-graph --reset-cart --url "https://www.amazon.com/dp/0307887898" --tenant-id default --project-id us_book --feature-key amazon_checkout --enable-living-graph --debug
 
 # India book
-./.venv/bin/python scripts/crawl_dfs.py --reset-graph --reset-cart --url "https://www.amazon.in/dp/1847941834" --tenant-id default --project-id in_book --feature-key amazon_checkout --max-steps 24 --max-neighbors 5 --enable-living-graph --debug
+./.venv/bin/python scripts/crawl.py --reset-graph --reset-cart --url "https://www.amazon.in/dp/1847941834" --tenant-id default --project-id in_book --feature-key amazon_checkout --enable-living-graph --debug
 
 # India electronics (a laptop, etc.)
-./.venv/bin/python scripts/crawl_dfs.py --reset-graph --reset-cart --url "https://www.amazon.in/dp/B0DT74FF9P" --tenant-id default --project-id in_laptop --feature-key amazon_checkout --max-steps 24 --max-neighbors 5 --enable-living-graph --debug
+./.venv/bin/python scripts/crawl.py --reset-graph --reset-cart --url "https://www.amazon.in/dp/B0DT74FF9P" --tenant-id default --project-id in_laptop --feature-key amazon_checkout --enable-living-graph --debug
 ```
 
 Reusable template — change the two values and keep it on one line:
 
 ```bash
-URL="https://www.amazon.in/dp/XXXXXXXXXX"; PROJ="in_test"; ./.venv/bin/python scripts/crawl_dfs.py --reset-graph --reset-cart --url "$URL" --tenant-id default --project-id "$PROJ" --feature-key amazon_checkout --max-steps 24 --max-neighbors 5 --enable-living-graph --debug
+URL="https://www.amazon.in/dp/XXXXXXXXXX"; PROJ="in_test"; ./.venv/bin/python scripts/crawl.py --reset-graph --reset-cart --url "$URL" --tenant-id default --project-id "$PROJ" --feature-key amazon_checkout --enable-living-graph --debug
 ```
 
 A small heads-up: pick products that are **in stock with a normal Add to Cart
@@ -229,17 +227,16 @@ src/
     checkout_contract.py        # the "rules": intents, risk levels, states, inference rules
   explorer/
     graph_guided_explorer.py    # the conductor: runs the loop, does the reasoning
-    frontier.py                 # the DFS to-do list, with memory so nothing repeats
     browser_use_executor.py     # the thin layer that talks to browser-use
     page_observer.py            # turns a raw page into typed facts
-    semantic_normalizer.py      # maps messy UI into clean canonical intents + risk
-    llm_neighbors.py            # LLM scenario suggestions (with a safe fallback)
+    semantic_normalizer.py      # maps directed restore/probe intents when needed
+    graph_expansion.py          # graph/LLM missed-scenario probes after crawl convergence
   graph/
     store.py                    # all the Neo4j reads/writes and the reasoning queries
     blast_radius.py             # the PR-impact logic
   reporting/report.py           # the human-readable run report
 scripts/                        # login, crawl, inspect, blast-radius, build-the-PDF
-tests/                          # 45 unit tests (no browser/network/Neo4j needed)
+tests/                          # 54 unit tests (no browser/network/Neo4j needed)
 docs/                           # architecture notes, sample output, Part B PDF
 ```
 
