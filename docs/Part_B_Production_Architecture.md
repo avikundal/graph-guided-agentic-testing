@@ -1,42 +1,43 @@
 # Part B — Production Architecture
 
-*Turning the little Amazon-checkout prototype into the intelligence layer of an agentic
-testing platform — the thing that sits between every code change and every confident
-release.*
+*Turning the little Amazon-checkout prototype into something a real testing platform
+could run on — the part of the stack a team leans on to decide what's actually safe to
+ship.*
 
-I wrote this the way I'd actually pitch it to a founding team: opinionated, specific
-enough that a senior engineer could start building from it, and honest about the parts
-I'd refuse to ship until I'd seen proof. Where a claim already has a working seed in
-Part A, I say so — §13 maps every production claim back to the function that already
-does a small version of it.
+I wrote this the way I'd actually pitch it: opinionated, detailed enough to hand to an
+engineer without a follow-up meeting, and honest about the parts I wouldn't ship until
+I'd watched them hold up. Where a claim already has a working seed in Part A, I say so —
+§13 maps every production claim back to the function that already does a small version of it.
 
-One framing up front, because it drives everything else. It would be easy to spend
-this document arguing about frameworks — LangGraph vs. a custom orchestrator, Neo4j
-vs. something else. I think that's the wrong fight. **The architecture that matters is
-the agent harness and the evaluation layer.** Get those two right and the framework
-underneath is a six-week refactor. Get them wrong and no framework saves you. So this
-document is organised around those two spines, and everything else — agents, models,
-graph, guardrails — hangs off them.
+One framing up front, because it shapes the rest. I could burn this whole document
+picking an orchestration framework — LangGraph, a custom orchestrator, whatever — and
+honestly it wouldn't change much; swapping the engine that runs the agents is a contained
+piece of work. The two things that are genuinely painful to change once you've built on
+them are the **agent harness** (the runtime the agents live inside) and the **evaluation
+loop** (how you actually know the system is improving and not quietly rotting). So I've
+built everything around those two, and let agents, models, graph and guardrails hang off them.
 
 ---
 
 ## 0 · The one belief this rests on
 
-A browser agent and a knowledge graph have opposite strengths, and the whole design is
-about letting each do only what it's good at.
+A browser agent and a knowledge graph are good at almost opposite things, and the whole
+design is really just about not asking either one to do the other's job.
 
-The browser agent is a **guesser**. Point it at a page and it'll find the thing that
-adds to cart — genuinely hard, fuzzy, page-specific work that survives Amazon shipping
-a redesign. But it's a terrible historian: it'll cheerfully tell you it succeeded when
-it didn't, and it has no memory of what it already tried.
+The browser agent is opportunistic. Point it at a page and it'll work out which control
+adds the item to the cart — genuinely hard, fuzzy work that keeps working after Amazon
+reshuffles the DOM. But it only ever exercises the paths it happens to walk down, and it's
+shaky about whether it actually pulled something off — it'll report success on an action
+that quietly did nothing.
 
-The graph is the mirror image. It can't click anything, but it's **structural memory**
-— it holds everything we've ever seen about checkout and can reason over it: what's
-been observed, what's actually been proven, what *should* exist but doesn't.
+The graph is the other kind of thing entirely. It can't click anything, but it's the part
+that *remembers*: every state we've seen, every control, what we actually proved versus
+merely noticed, and — the bit that matters most — what we'd expect to be there and haven't
+found.
 
-> **The belief:** the crawler is a probabilistic discovery device; the graph is the
-> structural memory that tells you what discovery missed. Neither is trustworthy alone.
-> The value is the loop between them — and the harness that keeps that loop honest.
+> **The bet this rests on:** the crawler is how you *discover*, the graph is how you
+> *remember and cross-examine*, and neither is worth much on its own. The value shows up
+> in the loop between them — and in the harness that stops that loop from lying to itself.
 
 The failure mode I actually lose sleep over isn't the agent missing a button. You can
 always crawl again. It's the system **silently believing something false** — "checkout
@@ -125,20 +126,20 @@ What the harness owns, concretely:
 - **HITL interrupts.** A clean protocol for "stop and ask a human" — with the run
   paused, not abandoned, so a person can answer and the workflow continues.
 
-Here's the thing I'd say in the room and mean it: the choice between LangGraph and a
-custom orchestrator genuinely is a refactor. The harness contracts — *what state looks
-like, how replay works, how output is validated, when a human is pulled in* — are the
-part that's expensive to get wrong and expensive to change later. So that's what I'd
-design and defend first.
+This is the thing I'd actually stand behind in a design review: which orchestration
+library sits underneath is close to interchangeable. What's expensive to get wrong — and
+expensive to unpick later — is the set of contracts the harness enforces: what state looks
+like, how a run replays, how an output gets checked, when a human is pulled in. So that's
+what I'd design and defend before anything else.
 
 ---
 
-## 3 · Guardrails, designed per agent — not as global middleware
+## 3 · Guardrails, built into each agent — not one shared layer
 
-Production agent systems fail in ways demos don't, and a single global "safety
-middleware" is the wrong shape for it, because every agent is uncertain about different
-things. So guardrails are **per agent**: each one declares what "uncertain" means for
-it and what happens at that boundary.
+Agent systems fall over in ways a demo never shows you, and bolting one shared "safety
+layer" across the whole thing is the wrong shape — each agent is unsure about completely
+different things. So I'd attach guardrails to each agent individually: every agent says
+what "not confident enough" means for *it*, and what to do the moment it crosses that line.
 
 The Part-A prototype already ships the sharpest example of this — the **deny-list
 safety veto**. I want to defend the shape of it, because it's the opposite of the
@@ -172,8 +173,9 @@ Around that, the production guardrail layer per agent:
 
 ## 4 · Model routing and composition
 
-This role is about being the most sophisticated *consumer* of models in the room, not
-training them. So I'd own a routing table, and I'd defend it with eval numbers rather
+I'm not training anything here — the whole job is picking the right model for each task
+and combining them without one model's guess turning into the next one's fact. So I'd
+keep a routing table, and I'd argue for it with eval numbers rather
 than brand preference. The principle is boring and correct: **deterministic by default,
 small models for high-volume fuzzy work, the frontier model only where reasoning value
 is high and volume is low.**
@@ -187,13 +189,13 @@ is high and volume is low.**
 
 A few opinions I'd stake:
 
-- **Compose models without compounding hallucination.** The danger in a pipeline is one
+- **Chain models without letting errors snowball.** The danger in a pipeline is one
   model's guess becoming the next model's "fact." The defence is the same as everywhere
   else here: between model stages sits a deterministic check or a graph lookup, so a
   guess never silently hardens into truth.
 - **Pin prompt + model versions.** Every run records which model and prompt version ran.
   When a provider ships a "better" model, I want to know it changed *my* decision quality
-  before a customer does — which is a canary-eval problem (§8), not a hope.
+  before a customer files a ticket — which is a canary-eval problem (§8), not a hope.
 - **Context management for long sessions.** A long agentic crawl accumulates context
   fast. I'd compress aggressively: the graph *is* the long-term memory, so the working
   context stays small — the agent pulls exactly the graph slice it needs via the Query
@@ -236,8 +238,8 @@ change every redesign. Model the graph around *what a control means* ("this is t
 add-to-cart capability") instead of *how to find it* (`#some-id`), and the graph stays
 meaningful across redesigns while selectors churn underneath as replaceable properties.
 
-**The edges are where the value is** — and I'd put **provenance and confidence on every
-edge**, not just nodes:
+**The edges are where most of the value lives** — and I'd hang two things off them that
+usually only get put on nodes: where the edge came from, and how sure we are of it.
 
 | Edge | Between | What it lets me ask |
 |---|---|---|
@@ -281,7 +283,7 @@ you *find* a starting node for the traversal.
 A graph is only as useful as the questions the agents can ask it. Dumping the whole
 graph into a prompt doesn't work (context blows up, and the model drowns), and hand-
 writing a Cypher query for every agent need doesn't scale. So I'd build a **Query
-Machine**: the layer that sits between the agents and Neo4j and turns "what does the
+Machine**: the layer that lives between the agents and Neo4j and turns "what does the
 graph know?" into structured, bounded, typed answers the LLM can actually reason over.
 
 It has three tiers, and the ordering is the whole point:
@@ -332,12 +334,13 @@ Two things I'd design carefully because they're where "living" gets hard:
 
 - **Conflict resolution.** When this run disagrees with last week (the promo field was
   here, now it's gone), I don't overwrite — I keep both, stamped with `commit_sha` and
-  time, and let confidence decay carry the old signal down. "What did we know at time T"
-  stays answerable because I never destroy history; I supersede it.
-- **Decisions become signal.** Every validated agent decision is training signal for
-  tomorrow — a confirmed scenario raises the prior on the next run, a repeatedly-flaky one
-  lowers it. That's the compounding institutional asset the whole thing is about, and it's
-  why confidence decay (below) is load-bearing rather than a nice-to-have.
+  time, and let confidence decay carry the old signal down. If someone asks what the
+  system believed back at commit X, that's still answerable, because I never delete
+  history — I supersede it.
+- **Decisions become signal.** Every validated agent decision feeds the next run — a
+  confirmed scenario raises the prior, a repeatedly-flaky one lowers it. That's the part
+  that gets more valuable the longer the platform runs, and it's the reason the
+  confidence-decay mechanics below aren't a nice-to-have.
 
 Confidence decays unless something renews it — roughly, halve the distance to a floor each
 time a run *could* have confirmed a scenario but didn't; reset on a fresh confirmation. A
@@ -353,9 +356,10 @@ scenario that drops below threshold re-enters the retest frontier on its own.
 
 ## 8 · Eval and confidence — the other spine
 
-This is the layer that separates a research demo from a production system, and the JD is
-right that it *is* the architecture. Two places this system can be confidently wrong, and
-they need different checks: the agent clicked the wrong thing (perception), and the graph
+Honestly, this is the layer that decides whether you've built a product or a science
+project, and I'd put more design effort here than into any single agent. There are two
+places this system can be confidently wrong, and they need different checks: the agent
+clicked the wrong thing (perception), and the graph
 inferred a scenario that isn't real (reasoning).
 
 **Three eval layers I'd build:**
@@ -382,8 +386,9 @@ fast, but I'd own the golden sets and the grading logic in-house, because that's
 moat. **LLM-as-judge, calibrated against human spot-checks** — never an uncalibrated
 judge, and never a model grading something that has a deterministic check available.
 
-The confidence point deserves emphasis because it's an architectural requirement, not a
-feature: **the system has to know what it doesn't know.** Every agent output carries a
+The confidence point deserves its own emphasis, because I treat it as a structural
+requirement rather than a feature: **the system has to be honest about what it isn't sure
+of.** Every agent output carries a
 calibrated confidence, the harness gates on it, and I *measure* the calibration (ECE /
 Brier) rather than trusting it. Confidence without calibration is just false authority,
 and it doesn't go anywhere near a customer UI until the calibration check passes.
@@ -398,8 +403,8 @@ Agentic systems fail in ways ordinary services don't — same prompt, different 
 correct action the model *reports* as a failure; slow drift after a model upgrade. You
 can't operate that on plain logs.
 
-- **A trace ID that follows a reasoning chain** across every agent call, with model +
-  prompt version at each hop — **OpenTelemetry** as the backbone.
+- **One trace id threaded through the whole chain of agent calls**, with the model and
+  prompt version stamped at each hop — **OpenTelemetry** underneath.
 - **Decision audit trails** — the frontier score, the guardrail decision, the confidence,
   for every action that ran or was vetoed. Every decision is replayable.
 - **Latency + cost budgets per agent stage**, so a stall or runaway is an observable
@@ -468,15 +473,15 @@ This is the section I'd most expect to get grilled on, which is exactly why it's
 | Unreviewed cross-tenant learning | Priors may cross tenants; concepts/selectors/DOM/scenarios may not. First I'd want an audit log and a human promotion step. |
 | The prototype's hard-coded concept vocabulary, as-is | Fine for one feature, wrong for a hundred apps. Production replaces the keyword map with a learned, per-tenant concept model behind an adapter. |
 
-And since the JD asks it directly — **the hardest unsolved problem in production agent
-systems, in my view: knowing a probabilistic system is wrong *before* a human does.**
-Everything downstream depends on confidence you can trust, and calibrating confidence is
-genuinely hard when your judge is itself an LLM and the distribution keeps shifting under
-you (new app, new model, new sprint). I don't think there's a clean solved answer. The
-best I have is the architecture in this document — deterministic floors under the
-probabilistic parts, calibrated confidence measured not assumed, canaries between a model
-change and a customer, and a graph that remembers what was true so you can tell when it
-stops being true. That's the problem I'd want to spend the next few years on.
+If you asked me for the single hardest problem in this space, I'd give you this one:
+**knowing the system is wrong before a human notices.** Everything downstream leans on
+confidence you can actually trust, and calibrating that confidence is genuinely hard when
+the thing grading you is itself a model and the ground keeps moving under you — a new app,
+a new model version, a new sprint. I don't think there's a clean solved answer yet. The
+best I've got is the shape in this document: deterministic floors under the fuzzy parts,
+confidence that's measured rather than assumed, a canary between any model change and a
+customer, and a graph that remembers what used to be true so you can notice the moment it
+stops being true. That's the problem I'd happily spend the next few years on.
 
 ---
 
@@ -518,6 +523,6 @@ for and, just as important, what I'd avoid.
 | Artifacts | **S3 / GCS**; Neo4j holds refs only | Large DOM/screenshot blobs inside Neo4j |
 
 If I had to put the whole thing in one line: the valuable part was never the clever
-crawler — it's the loop between a probabilistic explorer and a structural memory, with a
-hard wall between what the system *did* and what it's allowed to *believe*. Get the harness
-and the eval layer right, and everything flashy underneath becomes a replaceable detail.
+crawler — it's the loop between something that explores and something that remembers, with
+a hard wall between what the system *did* and what it's allowed to *believe*. Get the
+harness and the eval layer right, and everything flashy underneath becomes a swappable detail.
