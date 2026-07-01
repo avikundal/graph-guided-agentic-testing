@@ -4,3 +4,7 @@ neo4j>=5.20.0
 openai>=1.40.0
 pytest>=8.2.0
 browser-use>=0.13.1
+
+# Part B PDF generation (optional)
+reportlab>=4.0
+pypdf>=4.0

@@ -26,7 +26,7 @@ spent most of my time.
 | A — how the graph is built | Schema, why I shaped it this way, the reasoning query | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | A — sample output | A real run, annotated: what the agent found, what the graph inferred, and the one scenario the agent **missed** but the graph caught | [docs/SAMPLE_OUTPUT.md](docs/SAMPLE_OUTPUT.md) |
 | A — PR blast radius (the optional stretch) | "If this code changes, which tests are at risk?" | `scripts/pr_blast_radius.py` |
-| **B — the architecture doc** | How this toy becomes real infrastructure for 100+ customers | **[docs/Part_B_Production_Architecture.md](docs/Part_B_Production_Architecture.md)** |
+| **B — the architecture doc** | How this toy becomes real infrastructure for 100+ customers | **[PDF](docs/Part_B_Production_Architecture.pdf)** · [Markdown](docs/Part_B_Production_Architecture.md) (regenerate with `scripts/build_part_b_pdf.py`) |
 
 There's a Loom walkthrough in the submission email too.
 

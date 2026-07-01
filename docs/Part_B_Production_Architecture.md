@@ -1,483 +1,523 @@
 # Part B — Production Architecture
 
-*How the little Amazon-checkout prototype becomes infrastructure that runs for 100+
-customers, eighteen months in, against apps that change every sprint.*
+*Turning the little Amazon-checkout prototype into the intelligence layer of an agentic
+testing platform — the thing that sits between every code change and every confident
+release.*
 
-This is a document I would defend to a founding team, not a textbook chapter. It is
-opinionated, it shows the trade-offs, and it names the things I would refuse to ship.
-Everything here has a working seed in Part A — §11 maps each production claim back to
-the function that already does a small version of it.
+I wrote this the way I'd actually pitch it to a founding team: opinionated, specific
+enough that a senior engineer could start building from it, and honest about the parts
+I'd refuse to ship until I'd seen proof. Where a claim already has a working seed in
+Part A, I say so — §13 maps every production claim back to the function that already
+does a small version of it.
 
----
-
-## 0 · The short version
-
-The prototype is two engines pointed at one feature, and the production plan is
-mostly "keep that division of labour and harden it."
-
-- **Engine 1 — the free crawler.** A browser agent (browser-use) explores Amazon
-  checkout *autonomously*. It is not handed a catalogue of actions to perform; it
-  pokes at whatever it notices — product options, the quantity stepper, delete,
-  save-for-later, coupons, proceed-to-checkout — and we write down everything it
-  touches. It is a **guesser**: it finds what it stumbles into.
-- **Engine 2 — the graph that reasons about the gaps.** Once the crawl stops finding
-  new behaviour, an LLM reads the Neo4j graph — what was *observed*, what was
-  *validated*, what was *expected and never seen* — and proposes the scenarios the
-  crawl skipped. Those proposals are then handed back to the browser agent as
-  **targeted probes**, and a deterministic Cypher layer keeps the whole thing honest.
-
-The one belief the architecture rests on: **the crawler is a probabilistic discovery
-device, and the graph is the structural memory that tells you what discovery missed.**
-Neither is trustworthy alone. The crawler hallucinates success; the graph can only
-reason about structure it has been taught. The value is in the loop between them.
-
-The production failure mode I worry about most is *not* the agent missing a button —
-you can always crawl again. It is the system **silently believing something false**:
-"checkout works" when the click never landed, or "the promo capability is gone" when
-the run just wandered. So the architecture is built to make confident-wrong states
-*expensive to reach* and *cheap to detect*.
-
-> **Decision.** Treat executor output as *evidence*, never *truth*. Every
-> "clicked" must be re-observed and asserted before it becomes "validated."
-> **Trade-off.** More observation steps, slightly higher cost per crawl.
-> **Refusal line.** I will not let an LLM's own self-report mark an action validated.
-
-Three things break this loop the moment you leave the demo, and they organise the
-rest of the document: **safety at scale** (§1, §9), **a graph that stays correct over
-time** (§2, §3), and **knowing any of it is right when both layers are probabilistic**
-(§4), all under a **cost ceiling** (§5) and **hard tenant isolation** (§6).
+One framing up front, because it drives everything else. It would be easy to spend
+this document arguing about frameworks — LangGraph vs. a custom orchestrator, Neo4j
+vs. something else. I think that's the wrong fight. **The architecture that matters is
+the agent harness and the evaluation layer.** Get those two right and the framework
+underneath is a six-week refactor. Get them wrong and no framework saves you. So this
+document is organised around those two spines, and everything else — agents, models,
+graph, guardrails — hangs off them.
 
 ---
 
-## 1 · Agent decomposition and boundaries
+## 0 · The one belief this rests on
 
-The biggest call I made is to **split responsibilities into small services instead of
-building one clever agent.** A single mega-agent that decides what to test, clicks it,
-judges whether it worked, and writes the result is impossible to trust, debug, or
-bound on cost — every failure is entangled with every other.
+A browser agent and a knowledge graph have opposite strengths, and the whole design is
+about letting each do only what it's good at.
 
-| Service | Owns | LLM? | The boundary I enforce |
+The browser agent is a **guesser**. Point it at a page and it'll find the thing that
+adds to cart — genuinely hard, fuzzy, page-specific work that survives Amazon shipping
+a redesign. But it's a terrible historian: it'll cheerfully tell you it succeeded when
+it didn't, and it has no memory of what it already tried.
+
+The graph is the mirror image. It can't click anything, but it's **structural memory**
+— it holds everything we've ever seen about checkout and can reason over it: what's
+been observed, what's actually been proven, what *should* exist but doesn't.
+
+> **The belief:** the crawler is a probabilistic discovery device; the graph is the
+> structural memory that tells you what discovery missed. Neither is trustworthy alone.
+> The value is the loop between them — and the harness that keeps that loop honest.
+
+The failure mode I actually lose sleep over isn't the agent missing a button. You can
+always crawl again. It's the system **silently believing something false** — "checkout
+works" when the click never landed, "the promo field is gone" when the agent just
+wandered. So the whole architecture is built to make confident-wrong states *expensive
+to reach and cheap to detect*. That single idea shows up in every section below.
+
+[[FIG:loop|The core loop: the graph plans, the browser acts, the harness validates and writes memory, and the graph reasons over what it learned — then does it again.]]
+
+---
+
+## 1 · The multi-agent network
+
+The biggest call I made is to split the work into small, single-purpose agents with
+hard boundaries, instead of building one clever agent that does everything. A mega-agent
+that decides what to test, clicks it, judges whether it worked, and writes the result is
+impossible to trust or debug — every failure is tangled up with every other one.
+
+At Testsigma's scale this becomes a network of specialised agents. Here's how I'd
+decompose it, with the boundary each one isn't allowed to cross:
+
+| Agent | Owns | LLM? | The boundary I enforce |
 |---|---|---|---|
-| **Free crawler** (Engine 1) | Autonomous exploration: which control to try next | **Yes** (small model) | Discovers and executes; it **never writes graph truth** and never decides what "passed." |
-| **Safety veto** | The deny-list, checked before *every* action | **No** | Runs in the agent's step callback *before* execution. A planning or model bug can never bypass it. |
-| **Observer** | Page snapshot → state, visible controls, concepts, raw artifacts | Mostly no | A small classifier is fine, but it must hand back the **raw evidence** (DOM, screenshot, URL). |
-| **Ingestor** | Idempotent graph writes: provenance, confidence, artifact refs | **No** | No model calls. Every write is typed, attributed, and replayable. |
-| **Graph reasoner** (Engine 2) | Missed / absent scenarios from graph structure | **LLM proposes, Cypher decides** | The trustworthy floor is deterministic; the LLM only *widens* the candidate set. |
-| **Probe director** | Turns a surfaced scenario into a narrow browser probe, on the right page | No | Navigates to the concept's home state, then asks Engine 1 to execute one intent. |
-| **Validator** | Deterministic post-conditions after an action | **No** | Required before "executed" may become "validated." Cannot be satisfied by model prose. |
+| **Planner** | The frontier — what to explore/test next, priorities, budgets | No | Decides *what*; it never touches the browser. |
+| **Crawler** | One UI action via browser-use (DOM, ARIA, screenshot) | Yes (small/fast) | Executes *how*; it never writes graph truth or decides what "passed." |
+| **Observer** | Page snapshot → typed state, controls, concepts, raw artifacts | Mostly no | Hands back the *raw evidence* (DOM, screenshot, URL), not a summary to trust. |
+| **Reasoner** | Missed / absent / causal scenarios from graph structure | LLM proposes, Cypher decides | The trustworthy floor is deterministic; the LLM only *widens* the candidate set. |
+| **Validator** | Deterministic post-conditions after an action | No | Nothing becomes "validated" until it re-checks from independent evidence. |
+| **Healer** | Selector repair when a locator breaks | Small model + graph | Proposes a fix; the Validator still has to confirm it. |
+| **Triage** | Cluster failures, decide flake vs. real regression | LLM + graph history | Escalates; it doesn't silently suppress. |
+| **Safety supervisor** | The guardrails, checked before every action | No | Vetoes *before* the browser ever sees the task. |
+| **Ingestor** | Idempotent graph writes with provenance + confidence | No | No model calls; every write is typed and replayable. |
 
-The boundary I care about most: **the crawler is allowed to *say* "I clicked Proceed
-to Checkout," but only the validator, re-observing the page, is allowed to *believe*
-it.** That single split is what keeps a probabilistic agent from writing false history
-into the graph.
+The boundary I care about most is between the Crawler and the Validator. **The Crawler
+is allowed to be wrong. The Validator's entire job is to not believe it.** When the
+Crawler says "I changed the quantity," the Validator re-reads the actual cart and checks
+the number moved — because the model is wrong about exactly that surprisingly often.
 
-I keep **safety as its own gate**, structurally separate from exploration, for the same
-reason banks separate the person who approves a payment from the person who requests
-it. In the prototype this is `safety_guard.veto_reason`, evaluated inside browser-use's
-step callback — which fires *after* the model picks an action but *before* the action
-executes. A raised veto stops the action from ever running.
+The other thing worth spelling out is what happens when an agent **fails, stalls, or
+returns low confidence** — because that's where demos and production part ways:
 
-### 1.1 · Why a deny-list, not an allow-list
+- **Fails** (throws, times out): the harness retries with backoff up to a budget, then
+  marks the step failed and moves on. A failed step is data, not a crash.
+- **Stalls** (keeps acting without progress — I actually hit this: the agent re-clicked
+  "increase quantity" four times): a per-run action ledger + a no-repeat guard turns it
+  into a fast veto instead of a runaway loop.
+- **Low confidence**: the agent doesn't get to quietly pass. Below its threshold it
+  either escalates to a stronger model, hands off to a human, or writes an explicit
+  "unverified" marker into the graph. Uncertainty is a first-class output, not an
+  inconvenience.
 
-This is the design decision I most want to defend, because it is the opposite of the
-obvious one.
+### 1.1 · The contract between agents
 
-The tempting choice is an **allow-list**: enumerate the safe actions, permit only
-those. It is safe, and it is wrong for *this* system. The entire reason to put a graph
-behind the crawler is to surface scenarios **nobody pre-conceived**. An allow-list can
-only ever permit actions someone already thought of — so it would block every newly
-discovered or graph-inferred intent and quietly defeat the product. A guardrail that
-only lets through what you already enumerated cannot guard a system whose job is to
-find the things you did not enumerate.
+Agents don't share a blob of state — they pass **typed contracts** (Pydantic schemas in
+Python), and that's deliberately the most important interface in the system. Every
+hand-off carries: the intent, the expected state it applies to, a **confidence
+structure** (not a vibe — a number plus what it's conditioned on), success evidence to
+look for, a risk class, and an escalation signal. I'd freeze those contracts before a
+single agent is built, because they're what lets me swap the model or the framework
+underneath any one agent without the others noticing.
 
-So safety is a **deny-list**: default-allow, and block a short, *enumerable* set of
-known-bad actions before they execute. The trick is that the genuinely dangerous
-actions are exactly the ones you *can* enumerate, because they are irreversible or
-identity-level:
-
-| Deny-list rule (prototype) | What it blocks | Why it is enumerable |
-|---|---|---|
-| `payment:text` / `payment:url` | Place order, Pay now, Buy now, order/payment endpoints | The money line is a finite, known set. |
-| `session:*` | Sign out, switch account | Identity-destroying; small and known. |
-| `off_product:other_item` / `:other_asin` / `:external` | Wandering onto a different product or site | The product under test is known; everything else is off-scope. |
-| `off_product:cart_recommendation_add` | Adding a *recommended* item from the cart page | On the cart page, any "add to cart" is a different item. |
-| `cart_scope:irrelevant_action` | Sponsored tiles / recommendation rails on the cart page | Cart pages have effectively infinite recommendation labels. |
-| `repeat:already_done` | Re-running an action already executed this run | Pure waste; bounded by what's been done. |
-
-Everything *reversible* — quantity, delete, save-for-later, promo, gift options — is
-fair game, because a mistake there is cheap and the validator + graph catch it. The
-deny-list's honest weakness (it cannot block an unknown-bad action it never enumerated)
-is bounded precisely because the unknown-bad actions that actually matter are
-irreversible, and irreversible actions on a checkout flow are a *short, known list*.
-I return to this, and how I would harden it, in §9.
-
-### 1.2 · The two runtime contracts
-
-Engine 1 and Engine 2 hand work to the browser through two different contracts:
-
-- **Free-crawl envelope** (Engine 1's day job): a goal ("explore this cart"), an
-  expected state, and the deny-list. Deliberately loose — looseness is where discovery
-  comes from. The only hard constraints are the veto and a **no-repeat / action-level
-  convergence** rule so the crawl can't loop forever or chase recommendation junk.
-- **Graph-probe contract** (Engine 2 → probe director → Engine 1): a specific
-  surfaced concept, the **home state** it lives in (so we navigate to the cart before
-  probing a cart behaviour, not hunt for it on a product page), a positive target, and
-  success evidence. Tight, because here we are *verifying a hypothesis*, not exploring.
-
-The contract fields that earn their place: `expected_state` (stops the agent hunting
-for cart controls on a checkout page), `success_evidence` (keeps "clicked" and
-"validated" as separate ideas), and `risk` (drives the safety and replay policy).
+[[FIG:agents|The agent network around the harness and the graph. Nothing writes graph truth except the Ingestor, and nothing becomes "validated" without the Validator.]]
 
 ---
 
-## 2 · The production graph schema
+## 2 · The agent harness — this is the architecture
 
-The obvious thing to reach for is the textbook hierarchy — Element → Component → Flow →
-Feature. I would **not** ship that as the spine. It models the UI's shape but not the
-two things this product actually sells: **provenance** (why do we believe this?) and
-**absence** (what should exist but doesn't?). The schema below is organised around the
-queries we must answer, not around the DOM tree.
+If I could only get one thing right, it'd be this. The **harness** is the runtime every
+agent runs inside. It owns state, retries, timeouts, tool dispatch, output-schema
+enforcement, deterministic replay, and the human-in-the-loop interrupt protocol.
+Frameworks like LangGraph give you the state-machine primitives; the value I'm adding
+lives *above* them.
 
-### 2.1 · Node types
+What the harness owns, concretely:
+
+- **State + replay.** Every run is a durable, resumable workflow — I'd use **Temporal**
+  here, because crawls are long-running and I want to replay a failure step-by-step six
+  weeks later, not guess at it. Every agent step is recorded with its inputs, outputs,
+  model + prompt version, and a trace ID.
+- **Structured tool dispatch + output validation.** Agents don't return prose that
+  something downstream parses hopefully. They return schema-validated objects, and a
+  response that doesn't fit the schema is a failure the harness catches — not silent
+  garbage that becomes ground truth.
+- **Retries, timeouts, circuit breakers.** Per-stage latency and token budgets. A stage
+  that blows its budget surfaces as an observable failure, not silent spend or a hang.
+- **HITL interrupts.** A clean protocol for "stop and ask a human" — with the run
+  paused, not abandoned, so a person can answer and the workflow continues.
+
+Here's the thing I'd say in the room and mean it: the choice between LangGraph and a
+custom orchestrator genuinely is a refactor. The harness contracts — *what state looks
+like, how replay works, how output is validated, when a human is pulled in* — are the
+part that's expensive to get wrong and expensive to change later. So that's what I'd
+design and defend first.
+
+---
+
+## 3 · Guardrails, designed per agent — not as global middleware
+
+Production agent systems fail in ways demos don't, and a single global "safety
+middleware" is the wrong shape for it, because every agent is uncertain about different
+things. So guardrails are **per agent**: each one declares what "uncertain" means for
+it and what happens at that boundary.
+
+The Part-A prototype already ships the sharpest example of this — the **deny-list
+safety veto**. I want to defend the shape of it, because it's the opposite of the
+obvious choice.
+
+The tempting move is an **allow-list**: enumerate the safe actions, permit only those.
+Safe, and wrong for *this* system. The whole reason to put a graph behind the crawler is
+to surface scenarios nobody pre-conceived — an allow-list can only permit actions
+someone already thought of, so it would block every newly discovered or graph-inferred
+intent and quietly defeat the product. A guardrail that only passes what you already
+enumerated can't guard a system whose job is to find what you *didn't* enumerate.
+
+So safety is a **deny-list**: default-allow, block a short, enumerable set of known-bad
+actions before they execute. The trick is that the genuinely dangerous actions are
+exactly the ones you *can* enumerate, because they're irreversible or identity-level —
+place order, pay, sign out, navigate off the product under test. Everything reversible
+(quantity, delete, save-for-later, promo) is fair game, because a mistake there is cheap
+and the Validator catches it.
+
+Around that, the production guardrail layer per agent:
+
+| Guardrail | What it does |
+|---|---|
+| **Output validators / schema enforcement** | The agent's output must fit its contract or it's a failure, full stop. |
+| **Confidence gating** | Below threshold → escalate, fall back, or write "unverified." No silent low-confidence passes. |
+| **Circuit breakers** | An agent that fails N times in a row on a feature gets tripped and the feature is flagged, not hammered. |
+| **Fallback chains** | Frontier model → small model → deterministic rule → human, in that order, per agent. |
+| **The deny-list veto** | The one hard wall: irreversible actions blocked before execution, as a *separate* process a planning bug can't bypass. |
+
+---
+
+## 4 · Model routing and composition
+
+This role is about being the most sophisticated *consumer* of models in the room, not
+training them. So I'd own a routing table, and I'd defend it with eval numbers rather
+than brand preference. The principle is boring and correct: **deterministic by default,
+small models for high-volume fuzzy work, the frontier model only where reasoning value
+is high and volume is low.**
+
+| Task | What I'd route it to | Why |
+|---|---|---|
+| State resolution, validation, inference, ingestion | **Deterministic code (free)** | ~90% of operations. Must be explainable and repeatable. You never use a model to check a model. |
+| Which element to click (the Crawler) | **Small/fast** — GPT-4o-mini / Haiku / Gemini Flash | High volume, low stakes, latency-sensitive UI skill. |
+| Locator-stability / flake classification | **Fine-tuned small open model** (Mistral-class) | Narrow, repetitive, cheap to fine-tune, and it beats a frontier model on cost at this volume. |
+| Graph gap reasoning, root-cause chains, eval adjudication | **Frontier — Claude-class, extended thinking** | Low volume, high reasoning value; amortised across customers and releases. |
+
+A few opinions I'd stake:
+
+- **Compose models without compounding hallucination.** The danger in a pipeline is one
+  model's guess becoming the next model's "fact." The defence is the same as everywhere
+  else here: between model stages sits a deterministic check or a graph lookup, so a
+  guess never silently hardens into truth.
+- **Pin prompt + model versions.** Every run records which model and prompt version ran.
+  When a provider ships a "better" model, I want to know it changed *my* decision quality
+  before a customer does — which is a canary-eval problem (§8), not a hope.
+- **Context management for long sessions.** A long agentic crawl accumulates context
+  fast. I'd compress aggressively: the graph *is* the long-term memory, so the working
+  context stays small — the agent pulls exactly the graph slice it needs via the Query
+  Machine (§6) rather than dragging the whole history along.
+
+On cost, worked through: a feature-crawl in steady state is ~25 small-model steps at
+roughly 3k in / 0.3k out — call it 75k in / 7.5k out per crawl. The frontier model isn't
+in that path at all; it runs offline on rule discovery and eval adjudication, amortised
+across every customer. A customer crawling 50 features nightly is ~1,500 crawls/month,
+and the bill is dominated by the cheap model on purpose. The expensive levers I'd pull to
+keep it there: cache LLM calls by graph-state signature, invalidate bounded subgraphs
+instead of re-crawling everything, and never put a frontier model on the hot path.
+
+---
+
+## 5 · The production graph schema
+
+The textbook hierarchy for UI testing is `Element → Component → Flow → Feature`. I
+wouldn't use it as the backbone, because it models the UI's *shape* but not the two
+things this platform actually sells: **provenance** (why do we believe this?) and
+**absence** (what should exist but doesn't?). So I built the graph around the questions
+we have to answer, not around the DOM tree.
+
+**Node types**
 
 | Node | Key properties | A query it answers |
 |---|---|---|
-| **Tenant / App / Feature** | `tenant_id`, `app_id`, `feature_key` | Everything is tenant/app/feature scoped; one feature modeled deeply. |
-| **Run** | `run_id`, `commit_sha`, `started_at`, `model_version`, `prompt_version`, `cost` | What was known at run N vs N+1; canary and rollback analysis. |
-| **Observation** | `state`, `url`, `artifact_ref`, `screenshot_ref`, `step` | Replay and audit exactly what the browser saw. |
-| **Concept** | `key`, `kind`, `expected`, `observed`, `executed`, `validated`, `confidence`, `first_seen`, `last_seen` | Expected-not-observed; observed-not-validated; stale concepts. |
-| **Intent** | `source`, `status`, `risk`, `selector_ref`, `evidence`, `confidence` | Why an action ran, failed, or was vetoed — and *who* drove it (crawler vs graph). |
-| **Scenario** | feature-scoped `key`, `status`, `kind`, `confidence`, `last_confirmed_run` | Which scenarios are trusted right now versus decayed. |
-| **Selector** | `hash`, `css/xpath/role`, `quality`, `stability`, `last_failed` | PR blast radius and self-healing. |
-| **CodeArtifact** | `path`, `symbol`, `commit_sha` | Map a PR change to selectors, concepts, and scenarios. |
+| Tenant / App / Feature | ids | Everything is scoped; one feature modeled deeply. |
+| Run | `commit_sha`, `started_at`, `model_version`, `cost` | What did we know at run N vs. N+1? |
+| Observation | `state`, `url`, `artifact_ref`, `screenshot_ref` | Replay exactly what the browser saw. |
+| Concept | `key`, `kind`, `observed`, `validated`, `expected`, `confidence`, `first_seen`, `last_seen` | Expected-not-observed; observed-not-validated. |
+| Intent | `source`, `status`, `risk`, `selector_ref`, `confidence` | Why an action ran, passed, or was vetoed. |
+| Scenario | `key`, `status`, `confidence`, `last_confirmed_run` | Which scenarios are trusted right now vs. decayed. |
+| Selector | `hash`, `css/xpath/role`, `stability`, `last_failed` | Blast radius and self-healing. |
+| CodeArtifact | `path`, `symbol`, `commit_sha` | Map a PR change to selectors → concepts → scenarios. |
 
-### 2.2 · Edges
+The single most important choice: **the unit of meaning is a `Concept` — a behaviour —
+not a DOM element.** Selectors are the least stable thing in the whole system; they
+change every redesign. Model the graph around *what a control means* ("this is the
+add-to-cart capability") instead of *how to find it* (`#some-id`), and the graph stays
+meaningful across redesigns while selectors churn underneath as replaceable properties.
 
-The edges are the product. The ones that carry weight:
+**The edges are where the value is** — and I'd put **provenance and confidence on every
+edge**, not just nodes:
 
-- `Run -[:OBSERVED]-> Observation -[:EVIDENCES]-> Concept` — provenance for every
-  fact, traceable back to a screenshot.
-- `Intent -[:TARGETS]-> Concept` and `Intent -[:USED]-> Selector` — *why* an action
-  ran and *how* it found its target. Intent carries `source` so a graph-directed probe
-  is permanently distinguishable from a crawler stumble.
-- `Scenario -[:CONFIRMED_BY]-> Run` — the spine of the living graph (§3). A scenario's
-  trust is a function of *which runs* still confirm it.
-- `CodeArtifact -[:BACKS]-> Selector -[:EXERCISES]-> Concept -[:COVERED_BY]-> Scenario`
-  — the blast-radius traversal (§8), top to bottom.
-
-### 2.3 · Three changes from the prototype, each earning its keep
-
-1. **Scenario becomes feature-scoped, not run-scoped**, with `CONFIRMED_BY` edges back
-   to the runs that proved it. This is what lets confidence decay and lets a scenario
-   survive (or expire) across runs.
-2. **Selector becomes a first-class node** (the prototype keeps it as a property on the
-   intent). You cannot do PR blast radius or self-healing if the locator is buried
-   inside an intent.
-3. **`commit_sha` and time live on everything.** That turns "show me the concepts that
-   existed at commit X but not at HEAD" into a single query, which is the regression
-   half of absence modeling.
-
-### 2.4 · Indexes, constraints, and what does *not* belong in Neo4j
-
-Uniqueness constraints on `(tenant_id, app_id, feature_key, concept.key)` and on
-`scenario.key`; range indexes on `last_seen` and `commit_sha` for the temporal
-queries; an index on `selector.hash` for blast radius. The **DOM and screenshot blobs
-do not belong in Neo4j** — `Observation.artifact_ref` points at object storage (S3/GCS).
-The graph stores structure and references; the evidence store holds the heavy bytes.
-
-### 2.5 · Modeling absence — the part most designs skip
-
-Absence is not "missing data." For a testing platform it is often *the product itself*:
-the most valuable thing the graph can tell you is what **should** be there and isn't.
-
-| Type | Definition | Example |
+| Edge | Between | What it lets me ask |
 |---|---|---|
-| **Structural** | `expected ∧ ¬observed` | The expected checkout boundary was never reached. |
-| **Behavioural** | `observed ∧ ¬validated` | The quantity control exists, but the subtotal update was never *proven*. |
-| **Regression** | `last_seen < latest_run` | The promo field used to exist; gone after commit X. |
+| `OBSERVED` / `SAW_CONCEPT` | Run → Observation → Concept | "What did we see, and where?" |
+| `TARGETS` | Intent → Concept | "Which attempt exercised which behaviour, and did it pass?" |
+| `DEPENDS_ON` | Scenario → Concept | "Which concepts does this scenario rely on?" (blast radius) |
+| `SHOULD_CAUSE` | Concept → Concept | "This cause should produce this effect" — the causal expectation the reasoner checks |
+| `BACKS` | CodeArtifact → Selector | "Which code backs this locator?" (PR risk) |
 
-The prototype already ships the first two: a hand-authored set of expected concepts is
-seeded (`seed_expected_concepts`), and `missing_expected_concepts` plus the coverage
-summary report exactly what was expected and never observed/validated. Production adds
-the third by leaning on `commit_sha` and `last_seen`.
+Here's a concrete instance of the graph after one checkout crawl — small enough to read,
+real enough to reason over:
 
-### 2.6 · The reasoning: a deterministic floor with an LLM that widens it
+[[FIG:sample_graph|A sample knowledge graph after one Amazon-checkout crawl. Solid nodes were validated; the dashed subtotal node was observed but never proven; the dashed SHOULD_CAUSE edge is the causal gap the reasoner surfaces.]]
 
-This is the heart of the two-engine design, and the part where I am most careful about
-trust.
+That dashed `SHOULD_CAUSE` edge from *change-quantity* to *subtotal* — observed cause,
+expected effect, never proven — is exactly the kind of missed test the graph surfaces and
+the crawler would never have written for itself.
 
-- **The floor is deterministic.** Inference rules are *data, not code*: a set of
-  prerequisites plus the pivot action whose validation would close the gap. In the
-  prototype, `INFERENCE_RULES` + `GraphStore.infer_missed_scenarios` produce missed
-  scenarios from graph structure with plain Cypher. Because it is deterministic, it
-  **cannot hallucinate** — it can only be wrong if a rule is wrong, and rules are
-  reviewable, versioned, and testable.
-- **Engine 2 widens the candidate set.** An LLM reads the graph state (observed,
-  validated, expected, absent) and proposes *additional* gap scenarios the rules didn't
-  encode — "removing the last item should empty the cart," "an invalid promo should
-  show an error." In the prototype this is `graph_expansion.expand_from_graph`, with a
-  deterministic fallback when the model is unavailable.
+### 5.1 · Why a graph and not just vectors
 
-The division of trust: **the LLM may propose, but it does not get to decide a scenario
-is real.** A proposed scenario only earns trust by being *probed* (handed back to
-Engine 1, executed, and validated) or by matching a deterministic rule. This is the
-answer to "how do you use an LLM in the reasoning layer without it inventing tests
-that don't exist": you let it expand recall, and you make the deterministic layer and
-the validator the precision filter.
+I'd push back hard on "just use RAG for this." Vector similarity is great at "find me
+things like this," and useless at the three things that actually matter here:
+
+- **Absence.** "What test *should* exist and doesn't" is not a similarity query — there's
+  nothing to be similar to. It's a structural query over expected-but-not-observed, which
+  the graph answers in one hop and a vector store can't express at all.
+- **Temporal reasoning.** "What did the system know at commit X?" needs edges stamped
+  with time and `commit_sha`, not nearest neighbours.
+- **Multi-hop traversal.** `CodeArtifact → Selector → Concept → Scenario` is a four-hop
+  walk. Vectors give you one hop of fuzzy similarity; the walk is the whole point.
+
+Vectors still earn a place — selector repair and semantic matching — so I'd run
+**pgvector** (or Weaviate) alongside Neo4j as a **hybrid**: the graph is the source of
+truth, the vector index is an auxiliary lookup. It never replaces graph truth; it helps
+you *find* a starting node for the traversal.
 
 ---
 
-## 3 · Keeping the graph honest over time
+## 6 · The Query Machine — how the LLM actually uses the graph
+
+A graph is only as useful as the questions the agents can ask it. Dumping the whole
+graph into a prompt doesn't work (context blows up, and the model drowns), and hand-
+writing a Cypher query for every agent need doesn't scale. So I'd build a **Query
+Machine**: the layer that sits between the agents and Neo4j and turns "what does the
+graph know?" into structured, bounded, typed answers the LLM can actually reason over.
+
+It has three tiers, and the ordering is the whole point:
+
+1. **A library of parameterised, typed graph queries — exposed as tools.** These are the
+   90% case. `missed_scenarios(feature)`, `absence(feature)`, `blast_radius(concept)`,
+   `neighbours(concept, hops)`, `confidence_of(scenario)`, `what_did_we_know_at(commit)`.
+   Each is hand-written, reviewed Cypher with a typed result schema. The agent LLM picks
+   a query and fills the parameters as a structured tool call — it never writes Cypher.
+   Deterministic, cacheable, can't hallucinate a traversal.
+2. **Guarded natural-language → Cypher, for the long tail.** When an agent has a genuinely
+   novel question, a frontier model translates it to Cypher — but the query runs
+   **read-only**, against a schema allow-list, with a cost/row cap, and the generated
+   Cypher is logged for review. If it fails validation, it falls back to tier 1. The LLM
+   gets flexibility without getting the keys to the database.
+3. **Hybrid graph + vector.** For "find the right starting node" the Query Machine can
+   hit pgvector first (semantic match on a concept/selector), then hand the node id to a
+   graph traversal. Similarity to *locate*, structure to *reason*.
+
+Every answer comes back the same way: typed rows, each carrying provenance and confidence,
+small enough to drop into the model's context. That's what "the graph information can be
+fully utilised by the LLM" actually means in practice — not a bigger prompt, but a
+**bounded, trustworthy query interface** the agent calls like any other tool.
+
+[[FIG:query_machine|The Query Machine: agents ask questions as typed tool calls; deterministic Cypher templates answer the common ones; a guarded NL→Cypher path handles the long tail; every answer is typed, provenance-tagged, and small enough for the model's context.]]
+
+In Part A this exists in embryo: the deterministic inference (`infer_missed_scenarios`)
+and the blast-radius traversal are the first two "tools," and the graph-expansion LLM is
+the first taste of the NL path. Production is mostly turning that into a real, versioned,
+guard-railed query library.
+
+---
+
+## 7 · Keeping the graph correct over time (the living property)
 
 The brief pushes hardest here, rightly: how is the graph still correct on the 50th run,
-six months in, after 30 PRs? The answer is a clear split between what is incremental,
+six months in, after 30 PRs? The answer is a clean split between what's incremental,
 recomputed, invalidated, and what compounds.
 
-| Operation | Trigger | Implementation |
+| Operation | Trigger | How |
 |---|---|---|
-| **Incremental** | every crawl run | Upsert observations, bump `last_seen`, append evidence, update concept rollups, add `Scenario-[:CONFIRMED_BY]->Run`. O(seen this run). |
-| **Recomputed** | a run touching a feature | Re-run inference and scenario confidence **for that feature only**. Never global. |
-| **Invalidated** | a PR touches mapped code; a selector fails N runs; repeated validation failure | Mark a *bounded subgraph* stale; push the affected scenarios into the retest frontier. |
-| **Compounds** | many runs over time | Selector stability, flake rate, transition probabilities, confidence-decay curves — the six-month moat that a fresh competitor cannot clone. |
+| **Incremental** | every crawl | Upsert observations, bump `last_seen`, append evidence, add `Scenario-[:CONFIRMED_BY]->Run`. O(seen this run). |
+| **Recomputed** | a run touching a feature | Re-run inference + confidence **for that feature only**. Never global. |
+| **Invalidated** | a PR touches mapped code; a selector fails N times; repeated validation failure | Mark a *bounded subgraph* stale; push affected scenarios into the retest frontier. |
+| **Compounds** | many runs over time | Selector stability, flake rate, transition probabilities, confidence-decay curves — the six-month moat a fresh competitor can't clone. |
 
-### 3.1 · Confidence decay and retest
+Two things I'd design carefully because they're where "living" gets hard:
 
-Every scenario's confidence **decays unless something renews it** — roughly, halve the
-distance to a floor each time a run *could* have confirmed it but didn't, and reset on
-a fresh confirmation. A scenario that drops below threshold re-enters the retest
-frontier on its own.
+- **Conflict resolution.** When this run disagrees with last week (the promo field was
+  here, now it's gone), I don't overwrite — I keep both, stamped with `commit_sha` and
+  time, and let confidence decay carry the old signal down. "What did we know at time T"
+  stays answerable because I never destroy history; I supersede it.
+- **Decisions become signal.** Every validated agent decision is training signal for
+  tomorrow — a confirmed scenario raises the prior on the next run, a repeatedly-flaky one
+  lowers it. That's the compounding institutional asset the whole thing is about, and it's
+  why confidence decay (below) is load-bearing rather than a nice-to-have.
 
-> **Decision.** Freshness comes from **bounded invalidation**, not nightly full recompute.
-> **Trade-off.** You must maintain the code→selector→concept map that makes invalidation precise.
-> **Refusal line.** I will not ship "recompute the whole graph every night" as the freshness story — it is expensive and it *hides* drift instead of surfacing it.
+Confidence decays unless something renews it — roughly, halve the distance to a floor each
+time a run *could* have confirmed a scenario but didn't; reset on a fresh confirmation. A
+scenario that drops below threshold re-enters the retest frontier on its own.
+
+[[FIG:decay|Confidence over successive runs: a scenario decays when runs don't reconfirm it, and snaps back to full confidence the moment a run proves it again. Below the retest line it re-enters the frontier automatically.]]
+
+> **The refusal:** I will not ship "recompute the whole graph nightly" as the freshness
+> story. It's expensive and it *hides* drift. Bounded invalidation, proven on a golden
+> tenant to catch a real regression, is the version I'd defend.
 
 ---
 
-## 4 · How I'd know any of it is actually right
+## 8 · Eval and confidence — the other spine
 
-There are two places this system can be confidently wrong, and they need different
-checks: **the agent clicked the wrong thing**, and **the graph inferred a scenario that
-isn't real**. One is a perception problem, the other a reasoning problem.
+This is the layer that separates a research demo from a production system, and the JD is
+right that it *is* the architecture. Two places this system can be confidently wrong, and
+they need different checks: the agent clicked the wrong thing (perception), and the graph
+inferred a scenario that isn't real (reasoning).
+
+**Three eval layers I'd build:**
+
+1. **Offline golden apps + regression suites.** Versioned, human-labelled trajectories.
+   Every prompt or model change runs against them before it ships. Deterministic pass/fail
+   plus trajectory- and step-level grading.
+2. **Online production sampling.** A sampled slice of real runs graded continuously, so
+   you catch drift the golden set didn't anticipate.
+3. **Canary evals.** Every model/prompt bump runs against the golden trajectories *before*
+   customer rollout. This is what catches a provider shipping a "better" model that
+   quietly degrades *your* decision quality.
 
 | Question | Signal | Metric |
 |---|---|---|
-| Did it click the right target? | browser-use trace + positive/negative-target check | wrong-target rate, wander rate |
-| Did the action succeed? | deterministic post-condition after re-observation | validation pass rate |
-| Is the scenario reproducible? | replay across clean sessions + golden apps | flake rate, pass@k |
-| Are confidence scores calibrated? | predicted confidence vs observed reproduction | ECE, Brier score |
-| Did a model/prompt change regress? | canary evals on versioned golden trajectories | delta vs baseline |
+| Did it click the right target? | trace + positive/negative-target check | wrong-target rate, wander rate |
+| Did the action succeed? | deterministic post-condition after re-observe | validation pass rate |
+| Is the scenario reproducible? | replay across clean sessions | flake rate, pass@k |
+| Are confidence scores honest? | predicted confidence vs. observed reproduction | **ECE, Brier score** |
+| Did a model change regress us? | canary on versioned golden trajectories | delta vs. baseline |
 
-I would run **three eval layers**: offline **golden apps** with human-labeled states,
-actions, and scenarios (deterministic regression for prompt/model changes); **replay**
-of recorded trajectories across clean sessions (flake and reproduction); and
-**canaries** on every model or prompt bump before customer rollout.
+On tooling: I'd start on a managed eval store (Braintrust or LangSmith-style) to move
+fast, but I'd own the golden sets and the grading logic in-house, because that's the
+moat. **LLM-as-judge, calibrated against human spot-checks** — never an uncalibrated
+judge, and never a model grading something that has a deterministic check available.
 
-> **Decision.** Never use a model to grade a model on anything that has a deterministic check.
-> **Trade-off.** Building golden apps and labeled trajectories is real upfront work.
-> **Refusal line.** Confidence numbers do not go in the customer UI until the calibration check passes — uncalibrated confidence is just false authority.
+The confidence point deserves emphasis because it's an architectural requirement, not a
+feature: **the system has to know what it doesn't know.** Every agent output carries a
+calibrated confidence, the harness gates on it, and I *measure* the calibration (ECE /
+Brier) rather than trusting it. Confidence without calibration is just false authority,
+and it doesn't go anywhere near a customer UI until the calibration check passes.
 
----
-
-## 5 · What this costs, and which model does what
-
-The strategy is emphatically **not** "use the smartest model everywhere" — that is how
-inference bills reach five figures for work a regex could do. The rule is: **deterministic
-by default, small models for high-volume fuzzy work, the frontier model only for
-low-volume high-reasoning work, offline where possible.**
-
-| Task | Default | Why |
-|---|---|---|
-| State resolution, validation, inference floor, ingestion, convergence | **Deterministic (free)** | ~90% of operations; must be explainable and repeatable. Never use a model to check a model. |
-| Browser execution (which element to click) — Engine 1 | **Small/fast** — GPT-4o-mini / Haiku-class / Gemini Flash | High volume, low stakes, latency-sensitive UI skill. |
-| Graph gap proposals — Engine 2 | **Cached, mid-tier**, keyed by graph-state signature | Useful breadth, *not trusted directly*; re-used when the graph state hasn't changed. |
-| Rule discovery, eval adjudication, onboarding triage | **Frontier — Claude Opus-class**, offline | Low volume, high reasoning value; amortized across customers and releases. |
-
-### 5.1 · The math, worked through
-
-Per feature-crawl, steady state. Engine 1 runs ~25 browser steps at roughly 3k in /
-0.3k out tokens on a small model: ≈ **75k in / 7.5k out per crawl**. Engine 2 fires a
-handful of graph-reasoning calls only at convergence — say 4 calls at ~4k in / 0.5k
-out on a mid-tier model, cached by graph-state signature so an unchanged page costs
-nothing: ≈ **16k in / 2k out per crawl**, and often far less on cache hits.
-
-Scale it: a customer with 50 features crawled nightly is ≈ 50 × 30 = **1,500
-crawls/month**. At the per-crawl figures above, that is a small-model bill dominated by
-Engine 1, with Engine 2 a rounding error because it is gated on convergence and cached.
-The frontier model is **not** in this path at all — it runs offline on rule discovery
-and evals, amortized across the whole customer base.
-
-### 5.2 · Cost levers (the redesign added three concrete ones)
-
-| Lever | What it buys |
-|---|---|
-| **Action-level convergence** | The crawl stops when no *new* concept/label/validation appears — not after a fixed step budget, and not after a single concept. Short runs end short. |
-| **No-repeat guard** (`repeat:already_done`) | An action done once is vetoed if attempted again this run. Directly kills the "re-do the same thing five times" token drain. |
-| **Cart-scope bound** (`cart_scope:irrelevant_action`) | Recommendation rails create effectively infinite new labels; bounding the cart action surface is what lets convergence *actually converge* on a real Amazon page. |
-| Cache Engine 2 by graph-state signature | No repeat reasoning calls when the page and concepts haven't changed. |
-| Invalidate instead of full recrawl | You only spend on the bounded subgraph a PR touched. |
-
-> **Decision.** Budget tokens and latency per stage; a stall is an observable failure, not silent spend.
-> **Refusal line.** I refuse "LLM-judge every step in real time" — it makes cost scale with token price instead of with the number of real behaviours, and it puts a model in the trust path where a deterministic check belongs.
-
-### 5.3 · Production tooling
-
-Tooling falls out of the boundaries above, not the other way round.
-
-| Layer | Start with | Avoid |
-|---|---|---|
-| Browser execution | Playwright + constrained LLM executor | A fully autonomous agent with *no* action contract or veto. |
-| Graph store | Neo4j | Storing graph-shaped dependencies only in relational tables. |
-| Artifact storage | S3 / GCS | Putting large DOM/screenshot blobs *inside* Neo4j. |
-| Workflow orchestration | Temporal / durable queue | Fire-and-forget cron jobs for long, retryable crawls. |
-| Search / vector memory | pgvector / OpenSearch (auxiliary, for selector repair) | Letting vector similarity *replace* graph truth. |
-| Observability | OpenTelemetry + run traces + artifact refs | Plain logs with no trace IDs. |
-| Eval store | Versioned golden apps + labeled trajectories | Shipping prompt changes without canaries. |
+[[FIG:eval|The eval spine: offline golden sets and online sampling feed a grader (deterministic where possible, calibrated LLM-judge where not); calibration and canary gates stand between a model change and a customer.]]
 
 ---
 
-## 6 · A hundred customers, kept apart
+## 9 · Observability and operations
 
-My default here is to **over-isolate**, and I am comfortable saying so. In a tool that
-crawls people's web apps and stores their DOM and screenshots, a cross-tenant leak is
-existential.
+Agentic systems fail in ways ordinary services don't — same prompt, different outcome; a
+correct action the model *reports* as a failure; slow drift after a model upgrade. You
+can't operate that on plain logs.
+
+- **A trace ID that follows a reasoning chain** across every agent call, with model +
+  prompt version at each hop — **OpenTelemetry** as the backbone.
+- **Decision audit trails** — the frontier score, the guardrail decision, the confidence,
+  for every action that ran or was vetoed. Every decision is replayable.
+- **Latency + cost budgets per agent stage**, so a stall or runaway is an observable
+  failure, not silent spend.
+- **Anomaly detection tuned for non-determinism** — the alerts I'd actually wire:
+  executor wander-rate climbing after a model upgrade (a canary that shipped anyway),
+  validation-failure rate spiking on a feature (a real regression or a broken selector),
+  stale-concept count growing without new runs (the freshness loop stalled).
+
+And because autonomy should be *earned*, the platform moves through rollout modes rather
+than flipping a switch: observe-only → recommend → gated execution (safe actions auto-run,
+mutating ones need approval) → autonomous safe execution, only after confidence, flake
+rate, and safety thresholds clear.
+
+---
+
+## 10 · Multi-tenancy and scale
+
+The platform has to work for a team of five and a team of five hundred, and one
+customer's knowledge graph must never bleed into another's. My default here is to
+**over-isolate**, and I'm comfortable saying so — in a tool that crawls people's apps and
+stores their DOM and screenshots, a cross-tenant leak is existential.
 
 | Layer | Isolated per tenant | Shared |
 |---|---|---|
-| Graph | Tenant/app/feature partition; database-per-tenant for large accounts | Schema + inference engine (code, not data) |
+| Graph | Tenant/app/feature partition; database-per-tenant for big accounts | Schema + inference engine (code, not data) |
 | Artifacts | Per-tenant object-store namespace, retention, redaction | Storage implementation |
-| Models/prompts | Customer vocabulary stays isolated; versions visible in traces | Generic executor/reasoner prompt templates |
+| Models/prompts | Customer vocabulary stays isolated; versions in traces | Generic prompt templates |
 | Learning | **No** selectors, DOM, screenshots, or scenarios cross tenants | Aggregated, reviewed *structural priors* only |
-| Ops | Per-tenant budgets and throttles | Global monitoring + anomaly detection |
 
-Cross-customer learning is deliberately fenced. We may learn **structural priors** —
+For scale: **async agent execution** on a queue (**Celery + Redis**), long-running crawls
+as durable **Temporal** workflows, LLM calls cached by graph-state signature, and
+graph-query optimisation via the parameterised Query Machine (bounded, indexed queries
+instead of ad-hoc traversals). The heavy artifacts (DOM, screenshots) live in **S3/GCS**;
+Neo4j stores references only. Backend is **Python (async, typed) + FastAPI**, packaged in
+**Docker/K8s** on AWS or GCP.
+
+Cross-customer learning is deliberately fenced. We can learn *structural priors* —
 "checkout flows usually have a quantity→subtotal relationship" — as reviewed, aggregated
-shape. We may **never** move a selector, a DOM snapshot, a screenshot, or a scenario
-across a tenant boundary. The shared asset is the *schema and the inference engine*;
-the moat is each tenant's own compounded history.
+shape. We never move a selector, a DOM snapshot, or a scenario across a tenant boundary.
 
 ---
 
-## 7 · Operations and observability
+## 11 · PR blast radius
 
-Agentic systems fail in ways ordinary services do not: same prompt, different outcome;
-a correct click that the model *reports* as a failure; slow drift after a model upgrade.
-You cannot operate this on plain logs.
-
-| Telemetry | Example fields | Why it matters |
-|---|---|---|
-| Trace id per run/intent | tenant, app, feature, run_id, step, model_version, prompt_version | Reconstruct a failure across every service that touched it. |
-| Decision audit | convergence signal, graph priority, safety decision, confidence | Explain why an action ran or was vetoed. |
-| Artifact refs | DOM snapshot, screenshot, browser-use trace, transition | Human debugging and eval labeling. |
-| Cost / latency | tokens, model, cache hit, duration, retries | Budget governance and customer pricing. |
-| Health metrics | wander rate, validation-failure rate, stale-concept count, flake rate | Catch degradation before customers do. |
-
-The alerts I would actually wire: **executor wander rate climbing after a model
-upgrade** (the canary failed and shipped anyway), **validation-failure rate spiking on
-a feature** (a real regression or a broken selector), and **stale-concept count growing
-without new runs** (the freshness loop stalled).
-
-### 7.1 · Test accounts and environments
-
-A production agentic testing platform cannot depend on arbitrary customer *production*
-accounts and real money. Each tenant gets **dedicated test accounts and a target
-environment**, with the deny-list as the last line of defence even there. The platform
-never needs to reach a real payment to validate a checkout flow — reaching the checkout
-*boundary* is the assertion; crossing it is the thing we structurally forbid.
+The optional PR hook isn't a separate feature — it falls straight out of the graph. A PR
+is a set of changed `CodeArtifact`s, and the answer is a downward traversal:
+`CodeArtifact → Selector → Concept → Scenario → confidence`. The discipline is in the
+output: it's never "rerun all the checkout tests," it's "*these* two selectors, *these*
+validated scenarios, and *this* one inferred scenario are at risk — retest exactly those."
+Part A already does the traversal (`pr_blast_radius.py`); production adds confidence and
+freshness to the ranking.
 
 ---
 
-## 8 · PR blast radius
+## 12 · What I'd refuse to ship — and the hardest problem
 
-The optional PR hook is not a separate feature — it falls straight out of the same
-graph. A PR is a set of changed `CodeArtifact`s, and the answer is a downward traversal:
-
-| Step | Question it answers |
-|---|---|
-| CodeArtifact changed | What paths/symbols did the PR touch? |
-| CodeArtifact → Selector | Which UI locators/components are backed by this code? |
-| Selector → Concept | Which controls or capabilities are affected? |
-| Concept → Scenario | Which discovered *and inferred* scenarios are at risk? |
-| Scenario → Run / confidence | Which of those risks are stale, high-confidence, or just validated? |
-
-The discipline is in the output. It is **never** "rerun all the checkout tests." It is:
-*these* three selectors, *these* two validated scenarios, and *this* one inferred
-scenario are at risk — retest exactly those. The prototype already does the traversal
-(`scripts/pr_blast_radius.py`, `GraphStore.blast_radius`).
-
----
-
-## 9 · The things I'd refuse to ship
-
-This is the section I would most expect to be grilled on, which is exactly why it is
-here.
+This is the section I'd most expect to get grilled on, which is exactly why it's here.
 
 | Refusal | Why, and what I'd need first |
 |---|---|
-| **A path that can click final purchase/payment — even behind a flag.** | Flags get flipped. Money pages must be *structurally* incapable of a final submit: the deny-list enforced as a separate process, plus a target environment that has no real payment. First I'd want a red-team that *tries* to make it buy something and fails every time. |
-| **LLM self-report as validation.** | Every mutating action needs a deterministic post-condition. First I'd want a validator that cannot be satisfied by model prose — which the prototype already does for cart and checkout. |
-| **A deny-list with no upper bound on the unknown-bad.** | A deny-list cannot block a dangerous action nobody enumerated. I'm comfortable shipping it *only because* the irreversible actions on a checkout flow are a short, known set (payment, account, money) — and those are exactly what we deny. Before widening to new app types I'd want a per-app review of "what is irreversible here," plus the red-team above. This is the honest seam in the design, and I'd rather name it than paper over it. |
-| **The prototype's hard-coded concept vocabulary, as-is.** | Part A maps observed actions to canonical concepts (`action.delete_item`, `capability.promo_code`, …) with a deterministic keyword map, and scores coverage against a hand-authored expected list. That is a fine *prototype* shortcut and a poor *product*: it cannot generalise to a new app's vocabulary. Production replaces the keyword map with a learned, per-tenant concept model and treats the expected list as data discovered over runs, not a constant. First I'd want the concept layer behind an adapter so the core never hard-codes a single app's words. |
-| **Nightly full-graph recomputation as the freshness strategy.** | Expensive, and it hides drift. Invalidate bounded subgraphs instead. First I'd want the invalidation path proven to catch a real regression on a golden tenant. |
-| **Unreviewed cross-tenant learning.** | Aggregated priors may cross tenants; concepts, selectors, DOM, screenshots, and scenarios may not. First I'd want an audit log, a human promotion step, and a privacy review. |
-| **Site-specific hacks in the platform core.** | App quirks — marketplace URL handling, subtotal parsing, cart-readiness — belong in adapters. The core owns state, safety, validation, graph, and eval. First I'd want the adapter boundary plus two genuinely different apps running through it. |
+| A path that can click final purchase — even behind a flag | Flags get flipped. Money pages must be *structurally* incapable of a final submit. First I'd want a red-team that tries to make it buy something and fails every time. |
+| LLM self-report as validation | Every mutating action needs a deterministic post-condition. The prototype already does this for cart and checkout. |
+| An uncalibrated confidence number in the UI | Confidence without calibration is false authority. Not until §8's calibration check passes. |
+| Nightly full-graph recompute as the freshness story | Expensive, and it hides drift. Bounded invalidation, proven on a golden tenant. |
+| Unreviewed cross-tenant learning | Priors may cross tenants; concepts/selectors/DOM/scenarios may not. First I'd want an audit log and a human promotion step. |
+| The prototype's hard-coded concept vocabulary, as-is | Fine for one feature, wrong for a hundred apps. Production replaces the keyword map with a learned, per-tenant concept model behind an adapter. |
+
+And since the JD asks it directly — **the hardest unsolved problem in production agent
+systems, in my view: knowing a probabilistic system is wrong *before* a human does.**
+Everything downstream depends on confidence you can trust, and calibrating confidence is
+genuinely hard when your judge is itself an LLM and the distribution keeps shifting under
+you (new app, new model, new sprint). I don't think there's a clean solved answer. The
+best I have is the architecture in this document — deterministic floors under the
+probabilistic parts, calibrated confidence measured not assumed, canaries between a model
+change and a customer, and a graph that remembers what was true so you can tell when it
+stops being true. That's the problem I'd want to spend the next few years on.
 
 ---
 
-## 10 · Delivery roadmap
+## 13 · How Part A grounds every claim here
 
-I would ship in phases that keep the system **runnable after every step**.
+None of this is hand-waving — each production claim already has a working seed in the
+prototype:
 
-| Phase | Deliverable | Exit criteria |
+| Production claim | Prototype seed |
+|---|---|
+| Planner / Crawler split; graph plans, browser acts | `GraphGuidedExplorer._autonomous_loop`, `BrowserUseIntentExecutor` |
+| Guardrails an LLM can't bypass (deny-list, pre-execution) | `safety_guard.veto_reason`, in the browser-use step callback |
+| Executor output is evidence, not truth | re-observe + `_run_assertions`, cart-delta / checkout verification |
+| Graph reasons about missed + causal gaps | `infer_missed_scenarios`, `CAUSAL_EXPECTATIONS` / `SHOULD_CAUSE` |
+| The Query Machine (tier 1 + NL taste) | `infer_missed_scenarios`, `blast_radius`, `graph_expansion.expand_from_graph` |
+| Absence as a graph query | `seed_expected_concepts`, `missing_expected_concepts` |
+| Everything after the graph takes over is the graph's | `graph_phase_started` attribution |
+| PR blast radius as a traversal | `pr_blast_radius.py`, `GraphStore.blast_radius` |
+| Provenance + confidence on writes | `write_intent`, `write_observation` (source, confidence, last_seen) |
+
+---
+
+## 14 · The stack, and why
+
+Tools should fall out of the boundaries, not the other way round. Here's what I'd reach
+for and, just as important, what I'd avoid.
+
+| Layer | I'd start with | I'd avoid |
 |---|---|---|
-| 0 · Working slice | One feature, autonomous crawl, graph ingest, an inferred missed scenario | Add-to-cart + quantity validated; a graph-surfaced miss probed (**done in Part A**). |
-| 1 · Harness hardening | Deny-list veto, deterministic validator, no-repeat / convergence, strict provenance | No duplicate execution; no LLM self-report validation (**done**). |
-| 2 · Living graph | Feature-scoped scenarios, confidence decay, bounded invalidation | Stale selectors/concepts re-enter the retest frontier on their own. |
-| 3 · Eval harness | Golden apps, canaries, calibration dashboards | Model/prompt regressions caught before customer rollout. |
-| 4 · Multi-tenant beta | Tenant isolation, budgets, artifact retention, observability | 100-customer architecture exercised under load and cost tests. |
-| 5 · PR blast radius | CodeArtifact → Selector → Concept → Scenario traversal | A PR produces a bounded risk report and a retest plan (**seed in Part A**). |
+| Agent harness | Custom harness over **LangGraph** primitives; **Temporal** for durable runs | A fully autonomous agent with no state/replay contract |
+| Browser execution | **Playwright + browser-use**, sandboxed | An agent with no action contract or veto |
+| Graph store | **Neo4j** (temporal patterns, provenance/confidence on edges) | Graph-shaped deps in relational tables |
+| Retrieval | **pgvector / Weaviate**, auxiliary — hybrid graph+vector | Letting vector similarity replace graph truth |
+| Query Machine | Parameterised Cypher tool library + guarded NL→Cypher | Free-form model-written Cypher on the hot path |
+| Models | **Claude** (frontier reasoning/judge), **GPT-4o-mini / Haiku / Gemini Flash** (executor), **fine-tuned Mistral-class** (narrow classifiers), deterministic for validation | "We use OpenAI" as the whole model strategy |
+| Eval | Versioned golden apps; **Braintrust/LangSmith-style** store; calibrated LLM-judge | Shipping prompt changes without canaries |
+| Observability | **OpenTelemetry** + trace IDs + decision audit | Plain logs with no trace IDs |
+| Async / queue | **Celery + Redis**; **FastAPI**; **Docker/K8s** on AWS/GCP | Fire-and-forget cron for long, retryable crawls |
+| Artifacts | **S3 / GCS**; Neo4j holds refs only | Large DOM/screenshot blobs inside Neo4j |
 
-### 10.1 · Rollout modes — autonomy is earned, not assumed
-
-The platform moves through modes rather than flipping a switch:
-
-| Mode | What the platform is allowed to do |
-|---|---|
-| 1 · Observe-only | Crawl and build the graph; no mutating clicks. |
-| 2 · Recommend | Surface inferred scenarios and blast radius, but do not execute them. |
-| 3 · Gated execution | Safe actions auto-run; mutating/destructive actions need policy approval. |
-| 4 · Autonomous safe execution | Only after confidence, flake rate, and safety checks clear thresholds. |
-
----
-
-## 11 · How Part A grounds every claim here
-
-None of this is hypothetical. Each production claim already has a working seed:
-
-| Production claim | Prototype function |
-|---|---|
-| Two engines: free crawl, then graph closes the gaps | `GraphGuidedExplorer._autonomous_loop` (Phase A/B/C), `BrowserUseIntentExecutor.explore_autonomously` |
-| Safety an LLM cannot bypass (deny-list, pre-execution) | `safety_guard.veto_reason`, run inside browser-use's step callback |
-| Bounded action surface / cost control | `is_cart_relevant_action`, no-repeat `_done_labels`, action-level convergence in `_autonomous_loop` |
-| Executor output is evidence, not truth (re-observe + assert) | `_run_assertions`, `_checkout_reached_ok`, cart-delta provenance |
-| Graph *reasons* about missed scenarios (Engine 2) | `graph_expansion.expand_from_graph` + deterministic `GraphStore.infer_missed_scenarios` / `INFERENCE_RULES` |
-| Graph reasoning feeds back into exploration, with honest attribution | `_run_graph_probes`, strict `graph_directed` crediting in `_ingest_autonomous` |
-| Absence as a graph query | `seed_expected_concepts`, `missing_expected_concepts`, `_coverage_summary` |
-| PR blast radius as a graph traversal | `scripts/pr_blast_radius.py`, `GraphStore.blast_radius` |
-| Quantified graph value | the report's "Graph impact" block |
-
----
-
-## 12 · Where I'd plant the flag
-
-If I had to put the whole argument in one line: **the valuable thing here was never the
-clever crawler — it was the loop between a probabilistic explorer and a structural
-memory, with a hard wall between what the system *did* and what it is allowed to
-*believe*.**
-
-A browser agent finds what it bumps into. A graph reasons about what should exist. The
-deny-list keeps the explorer free without letting it do anything irreversible, and the
-deterministic validator and inference floor keep the graph from believing the agent's
-optimism. Get *that* right — the boundaries, the provenance, the absence modeling, the
-earned autonomy — and the flashy parts (browser-use, Playwright, whichever model is in
-fashion this quarter) become replaceable implementation details. That is the system I'd
-defend, and the one I would actually want on call at 3 a.m.
+If I had to put the whole thing in one line: the valuable part was never the clever
+crawler — it's the loop between a probabilistic explorer and a structural memory, with a
+hard wall between what the system *did* and what it's allowed to *believe*. Get the harness
+and the eval layer right, and everything flashy underneath becomes a replaceable detail.
