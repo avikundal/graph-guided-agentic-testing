@@ -122,6 +122,10 @@ def test_cart_page_blocks_recommendation_junk_but_allows_cart_controls():
     for label in [
         "Sponsored product tile Van Heusen Solid Polo",
         "See more similar items",
+        # ratings/reviews are NOT cart controls: clicking them navigates into review
+        # pages and burns steps, so on the cart page they are vetoed as irrelevant.
+        "4.3 out of 5 stars, 2,391 ratings",
+        "Customer reviews",
     ]:
         r = veto_reason(target_label=label, action_url="", action_type="click",
                         product_asin=PROD_ASIN, base_host=BASE_HOST, page_state="shopping_cart")
@@ -134,8 +138,6 @@ def test_cart_page_blocks_recommendation_junk_but_allows_cart_controls():
         "Apply coupon",
         "Proceed to checkout",
         "Go to Cart",
-        "4.3 out of 5 stars, 2,391 ratings",
-        "Customer reviews",
     ]:
         assert veto_reason(target_label=label, action_url="", action_type="click",
                            product_asin=PROD_ASIN, base_host=BASE_HOST, page_state="shopping_cart") is None

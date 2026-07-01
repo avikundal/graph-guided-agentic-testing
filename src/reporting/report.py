@@ -120,29 +120,6 @@ def render_report(r: ExplorationReport, *, debug: bool = False) -> str:
         lines.append(f"  - Net: {crawler_only} directly-validated behaviors -> {crawler_only + scen} documented + reasoned scenarios.")
         lines.append("")
 
-        # Closed-loop graph exploration: the graph is the planner, browser-use the
-        # actuator. One experiment per iteration, graph updated after each.
-        lines.append("Closed-loop graph exploration (graph = planner, browser-use = actuator):")
-        lines.append(f"  - Experiments proposed:                              {gi.get('graph_experiments_proposed', 0)}")
-        lines.append(f"  - Experiments accepted (survived filtering):         {gi.get('graph_experiments_accepted', 0)}")
-        lines.append(f"  - Experiments executed:                              {gi.get('graph_experiments_executed', 0)}")
-        lines.append(f"  - Experiments successful (new graph info):           {gi.get('graph_experiments_successful', 0)}")
-        lines.append(f"  - Concepts discovered by the graph:                  {gi.get('graph_new_nodes', 0)} "
-                     f"({', '.join(gi.get('graph_concepts_discovered', [])) or 'none'})")
-        lines.append(f"  - New graph edges written by graph experiments:      {gi.get('graph_new_edges', 0)}")
-        lines.append(f"  - Coverage before -> after graph:                    {gi.get('coverage_before_graph_pct', 0)}% -> "
-                     f"{gi.get('coverage_after_graph_pct', 0)}%  (+{gi.get('coverage_increase_pct', 0)} pts)")
-        lines.append(f"  - Information gain per experiment:                   {gi.get('info_gain_per_experiment', 0)}")
-        exp_log = gi.get("graph_experiment_log", [])
-        if exp_log:
-            lines.append("")
-            lines.append("Experiment log (Observe -> Reason -> Act -> Learn):")
-            for i, e in enumerate(exp_log, 1):
-                disc = ", ".join((e.get("new_concepts", []) + e.get("new_validations", []))) or "no new info"
-                lines.append(f"  {i:02d}. {e.get('title','')[:60]} [{e.get('target_state','')}] "
-                             f"policy={e.get('source','llm')} gain={e.get('info_gain',0)} -> {disc}")
-        lines.append("")
-
     cov = r.coverage or {}
     if cov:
         lines.append("Coverage & graph contribution:")
@@ -160,6 +137,9 @@ def render_report(r: ExplorationReport, *, debug: bool = False) -> str:
         for s in r.graph_scenarios:
             deps = ", ".join(s.get("depends_on", []))
             lines.append(f"  - {s['title']} [{s['status']}] source={s.get('source')} depends_on={deps}")
+    elif gi.get("graph_surfaced_missed"):
+        for t in gi.get("graph_surfaced_missed", [])[:10]:
+            lines.append(f"  - {t} [surfaced by graph reasoning]")
     else:
         lines.append("  - No graph-inferred scenarios were produced.")
     lines.append("")

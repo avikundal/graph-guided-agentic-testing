@@ -49,8 +49,10 @@ _ACCOUNT_LIST_TERMS = ("wish list", "wishlist", "add to wish", "add to list")
 _CART_CONTROL_TERMS = (
     "quantity", "increase", "decrease", "delete", "remove", "save for later",
     "move to cart", "coupon", "promo", "gift", "apply", "proceed", "checkout",
-    "go to cart", "view cart", "open cart", "rating", "ratings", "review",
-    "reviews", "stars", "out of 5",
+    "go to cart", "view cart", "open cart",
+    # NOTE: ratings/reviews/stars are deliberately NOT cart controls. They are
+    # observed passively; clicking them navigates away into review pages (unknown
+    # state) and burns steps, so on the cart page such clicks are vetoed.
 )
 
 _CART_JUNK_TERMS = (

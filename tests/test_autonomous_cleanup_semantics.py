@@ -81,7 +81,9 @@ def test_cart_untried_surface_ignores_recommendation_junk():
 
     assert "increase quantity" in labels
     assert "delete item" in labels
-    assert "4.3 out of 5 stars, 2391 ratings" in labels
+    # ratings and recommendation tiles are not cart controls -> excluded from the
+    # untried surface so the crawler doesn't wander into review/other-product pages
+    assert all("stars" not in label and "ratings" not in label for label in labels)
     assert all("sponsored" not in label for label in labels)
 
 

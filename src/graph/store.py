@@ -159,6 +159,7 @@ class GraphStore:
             WITH o
             UNWIND $concepts AS ck
             MERGE (c:Concept {tenant_id:$tenant_id, project_id:$project_id, feature_key:$feature_key, key:ck})
+            SET c.observed = true, c.last_seen = datetime()
             MERGE (o)-[:SAW_CONCEPT]->(c)
             """,
             params,

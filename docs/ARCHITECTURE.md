@@ -73,6 +73,15 @@ If I'd modeled the graph around elements, it would rot constantly. By modeling
 around *what a control means* ("this is the add-to-cart capability") rather than
 *how to find it* (`#some-id`), the graph stays meaningful across redesigns.
 
+**The edges that carry the meaning:**
+
+| Edge | Between | What it lets me ask |
+|---|---|---|
+| `OBSERVED` / `SAW_CONCEPT` | Run → Observation → Concept | "What did we see, and on which page?" (provenance) |
+| `TARGETS` | Intent → Concept | "Which attempt exercised which behaviour, and did it pass?" |
+| `DEPENDS_ON` | Scenario → Concept | "Which concepts does this scenario rely on?" (blast radius) |
+| `SHOULD_CAUSE` | Concept → Concept | "This cause should produce this effect" — the causal expectations the reasoner checks |
+
 Every node is also tagged with `tenant_id / project_id / feature_key`, which is the
 seed of multi-tenancy — even in this prototype, every query is scoped, so two
 different products or customers never bleed into each other.
@@ -102,6 +111,15 @@ that need to be present, and here's the action whose success would prove this
 behaviour." The query then asks the graph: for each rule, were all the prerequisite
 concepts actually observed, but the proving action never validated? If so, that's a
 missed scenario.
+
+On top of that, I seed the graph with **causal expectations** — `X SHOULD_CAUSE Y`
+edges between concepts (`action.proceed_to_checkout SHOULD_CAUSE
+domain.checkout_boundary`, `action.change_quantity SHOULD_CAUSE domain.subtotal`, and
+so on). These make the reasoning *causal* rather than merely structural: the graph
+can say "I observed the cause, I expect this effect, and nothing ever proved the
+effect happened" — which is exactly how it flags that Proceed-to-Checkout was never
+driven to the checkout boundary, and then sends a directed probe to close it. Adding
+a causal expectation is a one-line data edit (`CAUSAL_EXPECTATIONS`), not code.
 
 The rule path is deterministic; the graph-expansion LLM is deliberately a second
 pass after the free crawl has stopped finding new action-level evidence. Its output
