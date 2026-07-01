@@ -7,7 +7,7 @@ ship.*
 I wrote this the way I'd actually pitch it: opinionated, detailed enough to hand to an
 engineer without a follow-up meeting, and honest about the parts I wouldn't ship until
 I'd watched them hold up. Where a claim already has a working seed in Part A, I say so —
-§13 maps every production claim back to the function that already does a small version of it.
+§14 maps every production claim back to the function that already does a small version of it.
 
 One framing up front, because it shapes the rest. I could burn this whole document
 picking an orchestration framework — LangGraph, a custom orchestrator, whatever — and
@@ -98,6 +98,53 @@ structure** (not a vibe — a number plus what it's conditioned on), success evi
 look for, a risk class, and an escalation signal. I'd freeze those contracts before a
 single agent is built, because they're what lets me swap the model or the framework
 underneath any one agent without the others noticing.
+
+### 1.2 · How the Validator checks actions it has no rule for
+
+There is a fair question hiding in all of this. The Validator can only confirm things it
+knows how to check. So what happens when an agent does something real and useful, but the
+Validator has no rule for that exact action?
+
+The short answer is that it never pretends. Every action lands in one of three states,
+not two:
+
+- **Done and confirmed.** The Validator checked, and the effect really happened. This is
+  the only state we call "validated."
+- **Done but not confirmed.** We know the click landed, but we have not proven what it
+  did. We label this honestly as "unverified." We do not call it a success.
+- **Blocked or failed.** The action did not run at all.
+
+So a legitimate action the Validator cannot check is not thrown away, and it is not marked
+wrong. It is kept and marked "unverified." The system would rather admit it is not sure
+than claim a win it cannot back up. For a tool whose whole job is telling you what is safe
+to ship, that is the safe direction to be wrong in.
+
+The next question is the real one: how does the Validator learn to check new things
+without a person hand-writing a rule for every single action? There are four ways, listed
+from the one I trust most to the one I trust least.
+
+1. **The graph tells it what to expect.** The graph already stores cause-and-effect rules,
+   like "changing the quantity should change the subtotal." The Validator just reads that
+   rule and checks it. Adding a new check is a small data edit, not new code.
+2. **It checks things that must always be true.** Some facts hold no matter what action
+   ran. The cart total should equal the sum of the items. You should not be able to reach
+   checkout with an empty cart. A good action keeps these true. A bad one breaks one, and
+   we catch it.
+3. **It compares the page before and after.** Take a snapshot before the action and one
+   after. If nothing changed when something clearly should have, that is a red flag, and
+   you do not need a special rule to notice that nothing happened.
+4. **It asks a second model to be the judge — for the truly unknown.** When there is no
+   rule, no invariant, and no clear before-and-after signal, we fall back to an LLM acting
+   as a judge of whether the action did what it was supposed to. Two things keep this
+   honest. First, the judge is a *different* model from the one that took the action, so a
+   model is never grading its own work. Second, we regularly check how often the judge
+   agrees with a human, so we know exactly how much to trust it.
+
+The idea that ties all four together is simple: **validation is not a yes/no stamp, it is
+a confidence score.** A deterministic check gives high confidence. The LLM judge gives
+medium confidence, and we flag it. No check at all means the action stays "unverified"
+with low confidence and gets sent to a human or added to a saved test set. Nothing is ever
+quietly treated as true. The system is always allowed to say, out loud, that it is not sure.
 
 [[FIG:agents|The agent network around the harness and the graph. Nothing writes graph truth except the Ingestor, and nothing becomes "validated" without the Validator.]]
 
@@ -201,13 +248,31 @@ A few opinions I'd stake:
   context stays small — the agent pulls exactly the graph slice it needs via the Query
   Machine (§6) rather than dragging the whole history along.
 
-On cost, worked through: a feature-crawl in steady state is ~25 small-model steps at
-roughly 3k in / 0.3k out — call it 75k in / 7.5k out per crawl. The frontier model isn't
-in that path at all; it runs offline on rule discovery and eval adjudication, amortised
-across every customer. A customer crawling 50 features nightly is ~1,500 crawls/month,
-and the bill is dominated by the cheap model on purpose. The expensive levers I'd pull to
-keep it there: cache LLM calls by graph-state signature, invalidate bounded subgraphs
-instead of re-crawling everything, and never put a frontier model on the hot path.
+On cost — the brief asks me to show the math, so here it is. Two model tiers, with rough
+late-2025 per-million-token prices: the **small model** (GPT-4o-mini / Haiku class) at
+about $0.15 in / $0.60 out, and the **frontier model** (Claude / GPT-4o class) at about
+$3 in / $15 out.
+
+| Unit | What runs | Tokens | Cost |
+|---|---|---|---|
+| **Per feature-crawl** — the crawler | ~25 small-model steps @ ~3k in / 0.3k out | 75k in / 7.5k out | ~$0.016 |
+| Per feature-crawl — graph reasoning | ~4 calls at convergence, mostly cache hits | 16k in / 2k out | ~$0.004 (→ ~$0 cached) |
+| **One full crawl** | | | **~$0.02** |
+| **Per graph query** — tier-1 template | deterministic Cypher, no model | 0 | **~$0** |
+| Per graph query — tier-2 NL→Cypher (<5% of queries) | one frontier call | 2k in / 0.3k out | ~$0.01 |
+| **Per customer / month** — crawls | 50 features × 30 nights = 1,500 crawls | | **~$30** |
+| …with caching (~50% of pages unchanged night-to-night) | fewer live model calls | | **~$18–20** |
+| Frontier, offline (rule discovery, eval, canary) | platform-wide, amortised over customers | | **~$5 / customer** |
+| **All-in inference, per customer / month** | | | **~$25** |
+
+The shape matters more than the exact cents: a customer crawling 50 features every night
+lands around **$25 a month in model spend**, and it stays there for three reasons — the
+cheap model does roughly 95% of the calls, graph queries are mostly free deterministic
+Cypher, and the frontier model never touches the per-crawl path (it runs offline and gets
+amortised across everyone). The three levers that hold the line: cache model calls by
+graph-state signature so an unchanged page costs nothing, invalidate only the bounded
+subgraph a PR touched instead of re-crawling the world, and keep the frontier model off
+per-crawl work entirely.
 
 ---
 
@@ -275,6 +340,38 @@ Vectors still earn a place — selector repair and semantic matching — so I'd 
 **pgvector** (or Weaviate) alongside Neo4j as a **hybrid**: the graph is the source of
 truth, the vector index is an auxiliary lookup. It never replaces graph truth; it helps
 you *find* a starting node for the traversal.
+
+### 5.2 · Indexes and constraints I'd actually declare
+
+A schema without indexes is a wish. Here's what I'd declare on day one, and the query each
+one exists for:
+
+```cypher
+-- identity: makes MERGE correct under concurrency, and creates the index for free
+CREATE CONSTRAINT concept_id  IF NOT EXISTS
+  FOR (c:Concept)  REQUIRE (c.tenant_id, c.feature_key, c.key) IS NODE KEY;
+CREATE CONSTRAINT run_id      IF NOT EXISTS
+  FOR (r:Run)      REQUIRE (r.tenant_id, r.app_id, r.run_id)  IS NODE KEY;
+CREATE CONSTRAINT selector_id IF NOT EXISTS
+  FOR (s:Selector) REQUIRE (s.hash) IS UNIQUE;
+
+-- hot-path lookups and temporal queries
+CREATE INDEX concept_scope   IF NOT EXISTS FOR (c:Concept)      ON (c.tenant_id, c.feature_key);
+CREATE INDEX run_time        IF NOT EXISTS FOR (r:Run)          ON (r.commit_sha, r.started_at);
+CREATE INDEX code_artifact   IF NOT EXISTS FOR (a:CodeArtifact) ON (a.commit_sha, a.path, a.symbol);
+CREATE INDEX concept_lastseen IF NOT EXISTS FOR (c:Concept)     ON (c.last_seen);
+
+-- relationship (edge) properties for "what did we know at time T"
+CREATE INDEX edge_validity   IF NOT EXISTS FOR ()-[e:SHOULD_CAUSE]-() ON (e.valid_from, e.confidence);
+```
+
+A few of these earn their keep specifically. The unique index on `Selector(hash)` is what
+makes blast radius and self-healing fast — you find a locator by its content, not by where
+it sits on the page. The `CodeArtifact(commit_sha, path, symbol)` index is the entry point
+for the PR hook. And the relationship index on `valid_from / confidence` is what turns the
+temporal question — "what did the graph believe at commit X, and how sure was it?" — into a
+cheap lookup instead of a full scan. The heavy blobs (DOM, screenshots) are never indexed,
+because they never live in Neo4j; `Observation.artifact_ref` just points at object storage.
 
 ---
 
@@ -460,7 +557,42 @@ freshness to the ranking.
 
 ---
 
-## 12 · What I'd refuse to ship — and the hardest problem
+## 12 · The concerns the brief didn't list — but I'd raise anyway
+
+A few things aren't on the checklist and would come up in a real design review anyway.
+I'd rather put them on the table myself.
+
+**Security and privacy of what we capture.** We store DOM snapshots, screenshots, and
+session cookies — some of the most sensitive data a customer has. DOM and screenshots
+routinely contain personal data, and cookies *are* credentials. So: everything encrypted
+at rest with per-tenant keys; form values, tokens, and anything that looks like PII
+redacted out of the DOM *before* it's stored; screenshots retention-capped and
+access-controlled; cookies and auth tokens never written to logs or traces. Short
+retention by default, and a delete path a customer can actually trigger.
+
+**Test data and safe environments.** The platform must never crawl a real production
+account with real user data and real money. Each tenant gets dedicated test accounts and a
+sandboxed or staging target, seeded with known test data. The deny-list veto is the last
+line of defence even there — reaching the checkout *boundary* is the assertion; crossing it
+is the thing we structurally forbid.
+
+**Auth and session management.** The crawler has to be logged in to test anything real.
+Sessions are captured once — a human handles the OTP / CAPTCHA, exactly like the prototype's
+saved Amazon login — then stored encrypted, per tenant, and refreshed when they expire. The
+agent is never allowed near account-level controls (change password, sign out, switch
+account); that's enforced by the same deny-list that blocks payment, not by hoping the model
+behaves.
+
+**How it plugs into CI and the release gate.** The end goal is a PR hook: a pull request
+comes in, the blast-radius traversal names the handful of scenarios at risk, the platform
+re-tests exactly those, and the result gates the merge. But I'd *earn* that gate rather than
+assume it — start in recommend mode (post the risk report, block nothing), move to a gating
+mode only once the confidence numbers hold up, and make the gate flake-aware so a known-flaky
+test can't block a good release. A testing platform that cries wolf gets switched off.
+
+---
+
+## 13 · What I'd refuse to ship — and the hardest problem
 
 This is the section I'd most expect to get grilled on, which is exactly why it's here.
 
@@ -485,7 +617,7 @@ stops being true. That's the problem I'd happily spend the next few years on.
 
 ---
 
-## 13 · How Part A grounds every claim here
+## 14 · How Part A grounds every claim here
 
 None of this is hand-waving — each production claim already has a working seed in the
 prototype:
@@ -502,9 +634,29 @@ prototype:
 | PR blast radius as a traversal | `pr_blast_radius.py`, `GraphStore.blast_radius` |
 | Provenance + confidence on writes | `write_intent`, `write_observation` (source, confidence, last_seen) |
 
+And to make the "not just a crawler with a database" point concrete, here's one real run,
+three levels deep:
+
+- **Discovered by the crawler (it physically clicked it):** *Add to Cart works, and the
+  quantity stepper moves.* The crawler did these, and the Validator confirmed them by
+  re-reading the actual cart. Status: `crawl_validated`.
+- **Inferred by the graph (the crawler never did it):** *Proceeding to checkout should
+  reach the checkout boundary.* The free crawl poked around the cart and stopped — it never
+  pushed through to checkout on its own.
+- **Why the graph inferred it:** the graph holds the causal rule `action.proceed_to_checkout
+  SHOULD_CAUSE domain.checkout_boundary`. It had *observed* the Proceed-to-Checkout control,
+  but no attempt had ever validated the checkout boundary. Observed cause, expected effect,
+  no proof — that's a gap.
+- **The evidence behind it:** three queryable facts in the graph — `action.proceed_to_checkout`
+  marked observed, the `SHOULD_CAUSE` edge present, and `domain.checkout_boundary` expected
+  but not validated. Not a hunch; a structural query.
+- **What happened next:** the graph turned that gap into a directed probe, the browser clicked
+  Proceed, and it landed on the real checkout page — which is exactly what flipped the run's
+  end-to-end result to true. A crawler with a database would have stopped at "the cart looks fine."
+
 ---
 
-## 14 · The stack, and why
+## 15 · The stack, and why
 
 Tools should fall out of the boundaries, not the other way round. Here's what I'd reach
 for and, just as important, what I'd avoid.

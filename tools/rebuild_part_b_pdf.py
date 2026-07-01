@@ -17,7 +17,7 @@ from reportlab.platypus import (
 )
 
 
-OUT = "output/pdf/Part_B_Production_Architecture_Improved.pdf"
+OUT = "output/pdf/Part_B_Production_Architecture_Final.pdf"
 
 PAGE_W, PAGE_H = A4
 MARGIN_X = 18 * mm
@@ -233,7 +233,7 @@ class HarnessDiagram(Flowable):
 
 class GraphDiagram(Flowable):
     def __init__(self, w):
-        self.w, self.h = w, 60*mm
+        self.w, self.h = w, 72*mm
         super().__init__()
 
     def wrap(self, aw, ah):
@@ -243,32 +243,42 @@ class GraphDiagram(Flowable):
         c = self.canv
         c.setFillColor(colors.white)
         c.setStrokeColor(color)
+        c.setLineWidth(1.2)
         c.setDash(3, 2) if dashed else c.setDash()
-        c.circle(x, y, 10*mm, fill=1, stroke=1)
+        c.circle(x, y, 9*mm, fill=1, stroke=1)
         c.setDash()
+        centered_lines(c, x, y - 1, label, size=6.2, leading=6.6, fill=color)
+
+    def legend(self, x, y, title, color, text):
+        c = self.canv
+        c.setFillColor(colors.white)
+        c.setStrokeColor(color)
+        c.roundRect(x, y, 43*mm, 8*mm, 3, fill=1, stroke=1)
         c.setFillColor(color)
-        c.setFont("Helvetica-Bold", 6.6)
-        lines = label.split("|")
-        for i, line in enumerate(lines):
-            c.drawCentredString(x, y + (len(lines)-1-i)*3.5 - 2, line)
+        c.setFont("Helvetica-Bold", 5.7)
+        c.drawCentredString(x + 21.5*mm, y + 4.7*mm, title)
+        c.setFillColor(MUTED)
+        c.setFont("Helvetica", 5.2)
+        c.drawCentredString(x + 21.5*mm, y + 1.8*mm, text)
 
     def draw(self):
         c = self.canv
         pts = {
-            "run": (20*mm, 40*mm), "obs": (62*mm, 28*mm), "cart": (102*mm, 43*mm),
-            "qty": (101*mm, 14*mm), "subtotal": (145*mm, 30*mm), "checkout": (178*mm, 14*mm),
-            "scenario": (42*mm, 5*mm),
+            "run": (20*mm, 52*mm),
+            "obs": (58*mm, 42*mm),
+            "cart": (100*mm, 56*mm),
+            "qty": (102*mm, 28*mm),
+            "subtotal": (144*mm, 42*mm),
+            "checkout": (178*mm, 28*mm),
+            "scenario": (43*mm, 20*mm),
         }
-        for a, b, label in [
-            ("run", "obs", "OBSERVED"), ("obs", "cart", "SAW"), ("obs", "qty", "SAW"),
-            ("qty", "subtotal", "SHOULD_CAUSE"), ("scenario", "qty", "DEPENDS_ON"),
-            ("scenario", "checkout", "DEPENDS_ON"),
+        for a, b in [
+            ("run", "obs"), ("obs", "cart"), ("obs", "qty"),
+            ("qty", "subtotal"), ("scenario", "qty"),
+            ("scenario", "checkout"),
         ]:
             x1, y1 = pts[a]; x2, y2 = pts[b]
             arrow(c, x1, y1, x2, y2, colors.HexColor("#9AA8B6"))
-            c.setFont("Helvetica", 5.8)
-            c.setFillColor(MUTED)
-            c.drawCentredString((x1+x2)/2, (y1+y2)/2+3, label)
         self.node(*pts["run"], "Run|a14f", BLUE)
         self.node(*pts["obs"], "Observation|cart", TEAL)
         self.node(*pts["cart"], "add to|cart", GREEN)
@@ -276,6 +286,10 @@ class GraphDiagram(Flowable):
         self.node(*pts["subtotal"], "subtotal|gap", AMBER, True)
         self.node(*pts["checkout"], "checkout|boundary", GREEN)
         self.node(*pts["scenario"], "quantity to|subtotal", VIOLET)
+        self.legend(3*mm, 1*mm, "OBSERVED", BLUE, "run captured evidence")
+        self.legend(49*mm, 1*mm, "SAW", TEAL, "observation saw concept")
+        self.legend(95*mm, 1*mm, "SHOULD_CAUSE", AMBER, "expected effect gap")
+        self.legend(141*mm, 1*mm, "DEPENDS_ON", VIOLET, "scenario requirement")
 
 
 class QueryDiagram(Flowable):
@@ -405,8 +419,8 @@ def build():
     story += [
         P("Production architecture", "Kicker"),
         P("Part B - Production Architecture", "TitleLarge"),
-        P("Turning the Amazon-checkout prototype into the intelligence layer of an agentic testing platform - the layer between every code change and every confident release.", "Subtitle"),
-        P("The architecture is organised around two load-bearing spines: the agent harness and the evaluation layer. Framework choices can change; the contracts, replay model, validation discipline, graph memory, and confidence gates are the parts that must be designed carefully.", "Callout"),
+        P("Turning the Amazon-checkout prototype into something a real testing platform could run on - the part of the stack a team leans on to decide what is actually safe to ship.", "Subtitle"),
+        P("The architecture is built around two things that are painful to change later: the agent harness, where agents live, and the evaluation loop, where you prove the system is improving instead of quietly rotting.", "Callout"),
         Spacer(1, 5*mm),
         CoreLoopDiagram(width),
         P("The core loop: the graph plans, the browser acts, the harness validates and writes memory, and the graph reasons over what it learned.", "Caption"),
@@ -414,8 +428,8 @@ def build():
 
     section(story, "0. The one belief this rests on")
     story += [
-        P("A browser agent and a knowledge graph have opposite strengths. The browser agent is a probabilistic discovery device: it can find the control that adds to cart on a redesigned page, but it is a poor historian and can be confidently wrong. The graph cannot click anything, but it is structural memory: it records what was observed, what was proven, and what should exist but does not.", "BodyX"),
-        P("The design therefore makes confident-wrong states expensive to reach and cheap to detect. The crawler may be wrong; the graph and harness must keep that wrongness from becoming truth.", "Callout"),
+        P("A browser agent and a knowledge graph are good at almost opposite things. The browser agent is opportunistic: it can work out which control adds an item to cart after the DOM changes, but it only exercises the paths it happens to walk and can report success on an action that quietly did nothing.", "BodyX"),
+        P("The graph is the part that remembers: every state seen, every control, what was proved versus merely noticed, and what should exist but has not been found. The crawler discovers; the graph remembers and cross-examines; the harness stops the loop from lying to itself.", "Callout"),
     ]
 
     section(story, "1. The multi-agent network")
@@ -453,8 +467,8 @@ def build():
         "<b>HITL interrupts:</b> runs pause cleanly, ask a human, then resume with provenance intact.",
     ])
 
-    section(story, "3. Guardrails per agent")
-    story.append(P("A single global safety middleware is the wrong shape because each agent is uncertain about different things. Guardrails live with the agent contract.", "BodyX"))
+    section(story, "3. Guardrails built into each agent")
+    story.append(P("One shared safety layer across the whole system is the wrong shape because each agent is unsure about different things. Guardrails attach to each agent individually: every agent declares what not confident enough means, and what happens when it crosses that line.", "BodyX"))
     story.append(P("The Part-A deny-list safety veto is the right shape: default-allow reversible exploration, hard-block enumerable irreversible actions such as purchase, payment, sign-out, and navigation away from the product under test.", "Callout"))
     story.append(styled_table([
         ["Guardrail", "What it does"],
@@ -466,7 +480,7 @@ def build():
     ], [52*mm, 126*mm]))
 
     section(story, "4. Model routing and composition")
-    story.append(P("The principle is deterministic by default, small models for high-volume fuzzy work, and frontier models only where reasoning value is high and volume is low.", "BodyX"))
+    story.append(P("The job is choosing the right model for each task and combining them without one model's guess turning into the next one's fact. The principle is deterministic by default, small models for high-volume fuzzy work, and frontier models only where reasoning value is high and volume is low.", "BodyX"))
     story.append(styled_table([
         ["Task", "Route", "Why"],
         ["State resolution, validation, inference, ingestion", "Deterministic code", "About 90 percent of operations; must be explainable and repeatable."],
@@ -475,8 +489,8 @@ def build():
         ["Graph gap reasoning, root-cause chains, eval adjudication", "Frontier model", "Low volume, high reasoning value."],
     ], [56*mm, 45*mm, 77*mm]))
     bullets(story, [
-        "Compose models without compounding hallucination: put deterministic checks or graph lookups between model stages.",
-        "Pin prompt and model versions so provider changes are measured before customers feel them.",
+        "Chain models without letting errors snowball: put deterministic checks or graph lookups between model stages.",
+        "Pin prompt and model versions so provider changes are measured before customers file a ticket.",
         "Keep long sessions small by using the graph as long-term memory and querying only the needed slice.",
         "Keep frontier models off the hot path; cache small-model calls by graph-state signature and invalidate bounded subgraphs.",
     ])
@@ -495,6 +509,7 @@ def build():
         ["CodeArtifact", "path, symbol, commit_sha", "Map PR change to selectors to concepts to scenarios."],
     ], [34*mm, 66*mm, 78*mm]))
     story.append(P("The unit of meaning is a Concept - a behaviour - not a DOM element. Selectors churn; the meaning of 'add to cart' survives redesigns.", "Callout"))
+    story.append(P("The edges are where most of the value lives, so provenance and confidence belong on edges too: where the relationship came from, and how sure the system is of it.", "BodyX"))
     story.append(styled_table([
         ["Edge", "Between", "What it lets us ask"],
         ["OBSERVED / SAW_CONCEPT", "Run to Observation to Concept", "What did we see, and where?"],
@@ -515,7 +530,7 @@ def build():
 
     story.append(PageBreak())
     section(story, "6. The Query Machine")
-    story.append(P("The Query Machine sits between agents and Neo4j. It turns 'what does the graph know?' into bounded, typed answers instead of dumping the graph into a prompt or letting an agent write arbitrary Cypher.", "BodyX"))
+    story.append(P("The Query Machine lives between agents and Neo4j. It turns 'what does the graph know?' into bounded, typed answers instead of dumping the graph into a prompt or letting an agent write arbitrary Cypher.", "BodyX"))
     story.append(QueryDiagram(width))
     story.append(P("Agents ask structured questions; the Query Machine returns typed rows with provenance and confidence.", "Caption"))
     bullets(story, [
@@ -533,8 +548,8 @@ def build():
         ["Compounds", "Many runs over time", "Selector stability, flake rate, transition probabilities, and confidence-decay curves."],
     ], [31*mm, 55*mm, 92*mm]))
     bullets(story, [
-        "Conflict resolution preserves history instead of overwriting: old and new observations remain stamped by commit and time.",
-        "Validated decisions become signal: confirmed scenarios raise priors; flaky ones lower them.",
+        "Conflict resolution preserves history instead of overwriting: old and new observations remain stamped by commit and time, so what the system believed at commit X stays answerable.",
+        "Validated decisions feed the next run: confirmed scenarios raise priors; repeatedly flaky ones lower them.",
         "Full nightly recompute is rejected as the freshness story. Bounded invalidation is the defendable production shape.",
     ])
     story.append(ConfidenceChart(width))
@@ -542,7 +557,7 @@ def build():
 
     story.append(PageBreak())
     section(story, "8. Eval and confidence")
-    story.append(P("The eval layer protects against two confidently-wrong states: the agent clicked the wrong thing, and the graph inferred a scenario that is not real.", "BodyX"))
+    story.append(P("This is the layer that decides whether the system is a product or a science project. It protects against two confidently-wrong states: the agent clicked the wrong thing, and the graph inferred a scenario that is not real.", "BodyX"))
     story.append(EvalDiagram(width))
     story.append(P("Offline golden sets and online sampling feed graders; calibration and canary gates stand between a model change and customers.", "Caption"))
     story.append(styled_table([
@@ -557,7 +572,7 @@ def build():
 
     section(story, "9. Observability and operations")
     bullets(story, [
-        "Trace IDs follow reasoning chains across every agent call, with model and prompt versions at each hop.",
+        "One trace id follows the whole chain of agent calls, with model and prompt versions stamped at each hop.",
         "Decision audit trails record frontier score, guardrail choice, confidence, and veto/pass outcome.",
         "Latency and cost budgets per stage make stalls visible.",
         "Alerts focus on agentic failure modes: wander-rate drift, validation spikes, stale concepts, and model-upgrade regressions.",
@@ -588,7 +603,7 @@ def build():
         ["Unreviewed cross-tenant learning", "Only reviewed structural priors may cross tenants; never DOM, selectors, screenshots, or scenarios."],
         ["Hard-coded concept vocabulary as-is", "Fine for one feature; production needs a learned per-tenant concept model behind an adapter."],
     ], [64*mm, 114*mm]))
-    story.append(P("The hardest unsolved production-agent problem is knowing a probabilistic system is wrong before a human does. The architecture answers with deterministic floors, measured calibration, canaries, and a graph that remembers what was true so drift is visible.", "Callout"))
+    story.append(P("The hardest problem is knowing the system is wrong before a human notices. The architecture answers with deterministic floors under the fuzzy parts, confidence that is measured rather than assumed, canaries between model changes and customers, and a graph that remembers what used to be true so drift is visible.", "Callout"))
 
     section(story, "13. How Part A grounds every claim")
     story.append(styled_table([
@@ -617,7 +632,7 @@ def build():
         ["Async / queue", "Celery + Redis, FastAPI, Docker/K8s, AWS/GCP", "Fire-and-forget cron for retryable crawls"],
         ["Artifacts", "S3/GCS; Neo4j holds refs only", "Large DOM/screenshot blobs inside Neo4j"],
     ], [31*mm, 82*mm, 65*mm]))
-    story.append(P("In one line: the valuable part is not the clever crawler. It is the loop between a probabilistic explorer and structural memory, with a hard wall between what the system did and what it is allowed to believe.", "Callout"))
+    story.append(P("In one line: the valuable part is not the clever crawler. It is the loop between something that explores and something that remembers, with a hard wall between what the system did and what it is allowed to believe.", "Callout"))
 
     doc.build(story)
 
