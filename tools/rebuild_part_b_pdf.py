@@ -17,7 +17,7 @@ from reportlab.platypus import (
 )
 
 
-OUT = "output/pdf/Part_B_Production_Architecture_Final.pdf"
+OUT = "output/pdf/Part_B_Production_Architecture_TestSigma_Final.pdf"
 
 PAGE_W, PAGE_H = A4
 MARGIN_X = 18 * mm
@@ -139,6 +139,27 @@ def arrow(c, x1, y1, x2, y2, color=LINE):
         c.line(x2, y2, x2 + 5*math.cos(a+da), y2 + 5*math.sin(a+da))
 
 
+def orth_arrow(c, points, color=LINE, width=1.1, dash=None):
+    c.setStrokeColor(color)
+    c.setLineWidth(width)
+    if dash:
+        c.setDash(*dash)
+    else:
+        c.setDash()
+    for (x1, y1), (x2, y2) in zip(points, points[1:]):
+        c.line(x1, y1, x2, y2)
+    c.setDash()
+    if len(points) >= 2:
+        import math
+        x1, y1 = points[-2]
+        x2, y2 = points[-1]
+        a = math.atan2(y2-y1, x2-x1)
+        c.setStrokeColor(color)
+        c.setLineWidth(width)
+        for da in (2.65, -2.65):
+            c.line(x2, y2, x2 + 4.5*math.cos(a+da), y2 + 4.5*math.sin(a+da))
+
+
 def centered_lines(c, x, y, text, font="Helvetica-Bold", size=7, leading=8, fill=INK):
     lines = text.split("|")
     c.setFillColor(fill)
@@ -229,6 +250,114 @@ class HarnessDiagram(Flowable):
         c.setFillColor(MUTED)
         c.setFont("Helvetica-Oblique", 7)
         c.drawCentredString(self.w/2, 0, "Only the Ingestor writes graph truth; nothing becomes validated without the Validator.")
+
+
+class SystemDesignDiagram(Flowable):
+    def __init__(self, w):
+        self.w, self.h = w, 188*mm
+        self.s = w / (174*mm)
+        super().__init__()
+
+    def wrap(self, aw, ah):
+        return self.w, self.h
+
+    def X(self, v):
+        return v * mm * self.s
+
+    def Y(self, v):
+        return v * mm
+
+    def box(self, x, y, w, h, title, sub="", stroke=INK, fill=colors.white, title_size=6.5, sub_size=5.2):
+        c = self.canv
+        x, y, w, h = self.X(x), self.Y(y), self.X(w), self.Y(h)
+        c.setFillColor(fill)
+        c.setStrokeColor(stroke)
+        c.roundRect(x, y, w, h, 4, fill=1, stroke=1)
+        centered_lines(c, x+w/2, y+h/2 + (1.8 if sub else -1), title, size=title_size, leading=6.7, fill=stroke)
+        if sub:
+            centered_lines(c, x+w/2, y+3.2, sub, font="Helvetica", size=sub_size, leading=5.5, fill=MUTED)
+        return (x, y, w, h)
+
+    def band(self, y, h, label, fill):
+        c = self.canv
+        c.setFillColor(fill)
+        c.setStrokeColor(fill)
+        c.roundRect(0, self.Y(y), self.w, self.Y(h), 6, fill=1, stroke=0)
+        c.setFillColor(MUTED)
+        c.setFont("Helvetica-BoldOblique", 6.8)
+        c.drawString(self.X(3), self.Y(y+h-5), label)
+
+    def path(self, pts, color=colors.HexColor("#9AA8B6"), dash=None):
+        orth_arrow(self.canv, [(self.X(x), self.Y(y)) for x, y in pts], color=color, width=1.0, dash=dash)
+
+    def draw(self):
+        c = self.canv
+        c.setFont("Helvetica-Bold", 9)
+        c.setFillColor(INK)
+        c.drawString(0, self.Y(181), "Full production system design")
+        c.setFont("Helvetica", 6.2)
+        c.setFillColor(MUTED)
+        c.drawString(0, self.Y(176), "Components are boxes; connectors are routed around boxes. The only graph writer is the Ingestor.")
+
+        self.band(145, 26, "cross-cutting", colors.HexColor("#F1F3F5"))
+        self.band(70, 66, "act, orchestrate, route", colors.HexColor("#EEF3F8"))
+        self.band(6, 56, "remember", colors.HexColor("#ECF5EF"))
+
+        self.box(4, 154, 25, 11, "GitHub PR", "code change", colors.HexColor("#475569"), colors.HexColor("#F8FAFC"))
+        self.box(34, 154, 25, 11, "PR blast|radius", "risk set", VIOLET, colors.HexColor("#F3F0FA"), 6.0)
+        self.box(64, 154, 25, 11, "Release|gate", "block or advise", VIOLET, colors.HexColor("#F3F0FA"), 6.0)
+        self.box(97, 154, 35, 11, "Eval +|confidence", "golden, canary, ECE", AMBER, colors.HexColor("#FCF4E7"), 6.0)
+        self.box(137, 154, 33, 11, "Observability", "traces, audit", AMBER, colors.HexColor("#FCF4E7"), 6.0)
+
+        self.box(4, 108, 27, 19, "Target|web app", "app under test", colors.HexColor("#475569"), colors.white)
+        self.box(4, 78, 27, 19, "Browser|execution", "Playwright + browser-use", GREEN, colors.HexColor("#EEF7F1"), 6.0)
+        self.box(38, 91, 25, 18, "Safety|veto", "deny-list", AMBER, colors.HexColor("#FCF4E7"), 6.0)
+
+        self.box(69, 78, 55, 52, "Agent harness", "state, replay, schemas, HITL", colors.HexColor("#274766"), colors.HexColor("#F2F5F8"), 7.0, 4.8)
+        for title, x, y in [
+            ("Planner", 72, 114), ("Reasoner", 90, 114), ("Triage", 108, 114),
+            ("Crawler", 72, 101), ("Observer", 90, 101), ("Validator", 108, 101),
+            ("Healer", 72, 88), ("Ingestor", 90, 88),
+        ]:
+            self.box(x, y, 15, 8.6, title, "", colors.HexColor("#274766"), colors.HexColor("#E8EEF5"), 4.7)
+
+        self.box(132, 82, 39, 48, "Model router", "task to model, cost aware", VIOLET, colors.HexColor("#F3F0FA"), 6.4, 4.8)
+        self.box(135, 115, 15, 8, "Claude", "reason", VIOLET, colors.white, 4.8, 4.2)
+        self.box(153, 115, 15, 8, "GPT-4o|mini", "executor", VIOLET, colors.white, 4.6, 4.0)
+        self.box(135, 103, 15, 8, "Mistral", "classify", VIOLET, colors.white, 4.8, 4.2)
+        self.box(153, 103, 15, 8, "Code", "validate", VIOLET, colors.white, 4.8, 4.2)
+
+        self.box(4, 31, 37, 18, "S3 / GCS", "DOM, screenshots; graph refs only", colors.HexColor("#475569"), colors.white, 6.4, 4.7)
+        self.box(57, 37, 52, 19, "Query Machine", "typed Cypher | guarded NL | vector start", VIOLET, colors.HexColor("#F3F0FA"), 6.4, 4.8)
+        self.box(57, 12, 52, 19, "Neo4j knowledge|graph", "concepts, scenarios, confidence edges", GREEN, colors.HexColor("#EEF7F1"), 6.0, 4.7)
+        self.box(122, 14, 38, 17, "pgvector", "selector repair, semantic match", colors.HexColor("#274766"), colors.HexColor("#F2F5F8"), 6.2, 4.6)
+
+        # Cross-cutting flow.
+        self.path([(29, 159.5), (34, 159.5)], colors.HexColor("#6B7280"))
+        self.path([(59, 159.5), (64, 159.5)], VIOLET)
+        self.path([(89, 159.5), (97, 159.5)], VIOLET)
+        self.path([(132, 159.5), (137, 159.5)], AMBER)
+        self.path([(114, 154), (114, 136), (112, 136)], AMBER, dash=(3, 2))
+        self.path([(154, 154), (154, 136), (118, 136)], AMBER, dash=(3, 2))
+
+        # Action path: route around boxes, never through them.
+        self.path([(17.5, 108), (17.5, 97)], colors.HexColor("#6B7280"))
+        self.path([(31, 88), (38, 96)], AMBER)
+        self.path([(63, 100), (69, 104)], AMBER)
+        self.path([(69, 86), (64, 86), (64, 74), (31, 74), (31, 82)], GREEN)
+        self.path([(124, 106), (132, 106)], VIOLET)
+
+        # Memory and graph paths.
+        self.path([(81, 78), (81, 56)], VIOLET)
+        self.path([(83, 37), (83, 31)], VIOLET)
+        self.path([(109, 45), (122, 24)], colors.HexColor("#274766"))
+        self.path([(98, 88), (114, 88), (114, 21), (109, 21)], GREEN)
+        self.path([(88, 78), (88, 64), (45, 64), (45, 40), (41, 40)], colors.HexColor("#6B7280"))
+        self.path([(46.5, 154), (46.5, 141), (65, 141), (65, 64), (78, 64), (78, 56)], VIOLET, dash=(3, 2))
+
+        c.setFillColor(MUTED)
+        c.setFont("Helvetica-Oblique", 5.5)
+        c.drawCentredString(self.w/2, self.Y(1.5), "Safety veto is shown on the action path; it also runs as a harness gate. Heavy artifacts stay in object storage; Neo4j stores references and graph truth.")
 
 
 class GraphDiagram(Flowable):
@@ -456,9 +585,24 @@ def build():
     story.append(P("Every hand-off carries intent, expected state, confidence, evidence to seek, risk class, and escalation signal. Those Pydantic-style contracts are the durable interface that lets models or frameworks change underneath.", "BodyX"))
 
     story.append(PageBreak())
+    story.append(P("1.2 How the Validator handles unknown actions", "Subsection"))
+    story.append(P("The Validator can only fully confirm an action when it knows what evidence to check. So every action lands in one of three states: done and confirmed, done but unverified, or blocked/failed. The system keeps useful unknown actions, but it does not call them successful until there is proof.", "BodyX"))
+    story.append(styled_table([
+        ["Validator fallback", "How it keeps the result honest"],
+        ["Graph expectation", "Read cause-and-effect rules such as change_quantity SHOULD_CAUSE subtotal_change."],
+        ["Always-true invariants", "Check facts that should never break, such as totals matching item sums."],
+        ["Before / after comparison", "Look for meaningful state change when an action should have produced one."],
+        ["Calibrated judge", "Use a different model only when no rule or invariant exists, then measure judge agreement against humans."],
+    ], [48*mm, 130*mm]))
+    story.append(P("The safe default is simple: admit uncertainty. A tool that tells teams what is safe to ship should prefer 'unverified' over a confident but unsupported pass.", "Callout"))
+
+    section(story, "2. System design at a glance")
+    story.append(P("The full production system has three layers: cross-cutting release concerns, the agent runtime that acts on the app, and the memory layer that stores evidence and graph truth.", "BodyX"))
+    story.append(SystemDesignDiagram(width))
+    story.append(PageBreak())
     story.append(HarnessDiagram(width))
-    P("The agent network around the harness and graph.", "Caption")
-    story.append(P("The agent harness - this is the architecture", "Section"))
+    story.append(P("The agent network around the harness and graph.", "Caption"))
+    story.append(P("3. The agent harness - this is the architecture", "Section"))
     story.append(P("The harness owns state, retries, timeouts, tool dispatch, schema enforcement, deterministic replay, and human-in-the-loop interrupts. LangGraph can provide state-machine primitives; the durable value sits above it.", "BodyX"))
     bullets(story, [
         "<b>State and replay:</b> durable Temporal workflows record inputs, outputs, model and prompt versions, trace IDs, and artifacts.",
@@ -467,7 +611,7 @@ def build():
         "<b>HITL interrupts:</b> runs pause cleanly, ask a human, then resume with provenance intact.",
     ])
 
-    section(story, "3. Guardrails built into each agent")
+    section(story, "4. Guardrails built into each agent")
     story.append(P("One shared safety layer across the whole system is the wrong shape because each agent is unsure about different things. Guardrails attach to each agent individually: every agent declares what not confident enough means, and what happens when it crosses that line.", "BodyX"))
     story.append(P("The Part-A deny-list safety veto is the right shape: default-allow reversible exploration, hard-block enumerable irreversible actions such as purchase, payment, sign-out, and navigation away from the product under test.", "Callout"))
     story.append(styled_table([
@@ -479,7 +623,7 @@ def build():
         ["Deny-list veto", "Irreversible actions blocked before execution by a separate process."],
     ], [52*mm, 126*mm]))
 
-    section(story, "4. Model routing and composition")
+    section(story, "5. Model routing and composition")
     story.append(P("The job is choosing the right model for each task and combining them without one model's guess turning into the next one's fact. The principle is deterministic by default, small models for high-volume fuzzy work, and frontier models only where reasoning value is high and volume is low.", "BodyX"))
     story.append(styled_table([
         ["Task", "Route", "Why"],
@@ -495,7 +639,20 @@ def build():
         "Keep frontier models off the hot path; cache small-model calls by graph-state signature and invalidate bounded subgraphs.",
     ])
 
-    section(story, "5. The production graph schema")
+    story.append(P("Cost shape", "Subsection"))
+    story.append(P("The exact provider prices will move, so I would track this with current vendor pricing in production. The architecture target is more important: small models do nearly all live crawl work, graph queries are deterministic, and frontier models run offline or on rare long-tail questions.", "BodyX"))
+    story.append(styled_table([
+        ["Unit", "What runs", "Budget / cost shape"],
+        ["Per feature crawl", "About 25 small-model browser steps, roughly 75k input / 7.5k output tokens", "Around cents, not dollars"],
+        ["Graph reasoning", "Mostly cached deterministic Cypher; a few small calls near convergence", "Near zero on unchanged graph state"],
+        ["Tier-1 graph query", "Typed Cypher template", "No model cost"],
+        ["Tier-2 graph query", "Rare guarded NL-to-Cypher frontier call", "Use for under 5 percent of graph questions"],
+        ["50 features nightly", "1,500 crawls per customer per month", "Keep in the low tens of dollars with caching"],
+        ["Offline frontier work", "Rule discovery, eval adjudication, canaries", "Amortised across customers"],
+    ], [43*mm, 82*mm, 53*mm]))
+    story.append(P("The spend stays controlled because unchanged pages are cached by graph-state signature, PRs invalidate bounded subgraphs instead of the whole app, and the frontier model never sits on the normal crawl path.", "BodyX"))
+
+    section(story, "6. The production graph schema")
     story.append(P("The graph is not built around Element to Component to Flow to Feature. It is built around provenance and absence: why we believe something, and what should exist but does not.", "BodyX"))
     story.append(styled_table([
         ["Node", "Key properties", "Question answered"],
@@ -520,16 +677,28 @@ def build():
     ], [42*mm, 54*mm, 82*mm]))
     story.append(GraphDiagram(width))
     story.append(P("A sample checkout graph: the dashed subtotal node and SHOULD_CAUSE edge are the causal gap the reasoner surfaces.", "Caption"))
-    story.append(P("5.1 Why a graph and not just vectors", "Subsection"))
+    story.append(P("6.1 Why a graph and not just vectors", "Subsection"))
     bullets(story, [
         "<b>Absence:</b> missing tests are structural gaps, not similarity queries.",
         "<b>Temporal reasoning:</b> knowledge at commit X needs stamped edges and history.",
         "<b>Multi-hop traversal:</b> CodeArtifact to Selector to Concept to Scenario is the product.",
         "Vectors still help with selector repair and semantic matching, but only as an auxiliary index.",
     ])
+    story.append(P("6.2 Indexes and constraints I would declare", "Subsection"))
+    story.append(P("A graph schema without indexes is a wish. The indexes should map to the exact queries the platform will run every day.", "BodyX"))
+    story.append(styled_table([
+        ["Index / constraint", "Why it exists"],
+        ["Concept(tenant_id, feature_key, key)", "Makes concept upserts correct and answers expected-vs-observed questions inside one feature."],
+        ["Run(tenant_id, app_id, run_id)", "Keeps run identity stable and replayable."],
+        ["Selector(hash)", "Fast selector repair and PR blast radius by locator content."],
+        ["CodeArtifact(commit_sha, path, symbol)", "Entry point for the PR hook."],
+        ["Concept(tenant_id, feature_key)", "Hot-path scoped feature lookups."],
+        ["Run(commit_sha, started_at)", "Temporal questions such as what changed between two commits."],
+        ["SHOULD_CAUSE(valid_from, confidence)", "Cheap queries for what the graph believed at time T and how sure it was."],
+    ], [62*mm, 116*mm]))
 
     story.append(PageBreak())
-    section(story, "6. The Query Machine")
+    section(story, "7. The Query Machine")
     story.append(P("The Query Machine lives between agents and Neo4j. It turns 'what does the graph know?' into bounded, typed answers instead of dumping the graph into a prompt or letting an agent write arbitrary Cypher.", "BodyX"))
     story.append(QueryDiagram(width))
     story.append(P("Agents ask structured questions; the Query Machine returns typed rows with provenance and confidence.", "Caption"))
@@ -539,7 +708,7 @@ def build():
         "<b>Tier 3:</b> hybrid graph plus vector lookup: similarity finds the starting node, structure performs the reasoning.",
     ])
 
-    section(story, "7. Keeping the graph correct over time")
+    section(story, "8. Keeping the graph correct over time")
     story.append(styled_table([
         ["Operation", "Trigger", "How"],
         ["Incremental", "Every crawl", "Upsert observations, bump last_seen, append evidence, add Scenario-[:CONFIRMED_BY]->Run."],
@@ -556,7 +725,7 @@ def build():
     story.append(P("Confidence decays when runs do not reconfirm a scenario and snaps back on proof. Below the retest line it re-enters the frontier.", "Caption"))
 
     story.append(PageBreak())
-    section(story, "8. Eval and confidence")
+    section(story, "9. Eval and confidence")
     story.append(P("This is the layer that decides whether the system is a product or a science project. It protects against two confidently-wrong states: the agent clicked the wrong thing, and the graph inferred a scenario that is not real.", "BodyX"))
     story.append(EvalDiagram(width))
     story.append(P("Offline golden sets and online sampling feed graders; calibration and canary gates stand between a model change and customers.", "Caption"))
@@ -570,7 +739,7 @@ def build():
     ], [52*mm, 72*mm, 54*mm]))
     story.append(P("Use a managed eval store to move fast, but own the golden sets and grading logic in-house. LLM-as-judge must be calibrated against human spot-checks, and never used where a deterministic check exists.", "BodyX"))
 
-    section(story, "9. Observability and operations")
+    section(story, "10. Observability and operations")
     bullets(story, [
         "One trace id follows the whole chain of agent calls, with model and prompt versions stamped at each hop.",
         "Decision audit trails record frontier score, guardrail choice, confidence, and veto/pass outcome.",
@@ -579,7 +748,7 @@ def build():
         "Rollout moves from observe-only to recommend to gated execution to autonomous safe execution after thresholds clear.",
     ])
 
-    section(story, "10. Multi-tenancy and scale")
+    section(story, "11. Multi-tenancy and scale")
     story.append(styled_table([
         ["Layer", "Isolated per tenant", "Shared"],
         ["Graph", "Tenant/app/feature partition; database-per-tenant for large accounts", "Schema and inference engine code"],
@@ -590,10 +759,19 @@ def build():
     story.append(P("Scale shape: async agents on a queue, durable Temporal workflows, LLM-call caching by graph-state signature, bounded Query Machine traversals, and heavy DOM/screenshot artifacts in object storage while Neo4j stores references.", "BodyX"))
 
     story.append(PageBreak())
-    section(story, "11. PR blast radius")
+    section(story, "12. PR blast radius")
     story.append(P("The PR hook falls straight out of the graph: CodeArtifact to Selector to Concept to Scenario to confidence. The output should say exactly which selectors, validated scenarios, and inferred scenarios are at risk - not 'rerun all checkout tests.'", "BodyX"))
 
-    section(story, "12. What I would refuse to ship")
+    section(story, "13. Production concerns beyond the checklist")
+    story.append(styled_table([
+        ["Concern", "Production stance"],
+        ["Security and privacy", "DOM, screenshots, and sessions are sensitive. Encrypt per tenant, redact PII/tokens before storage, cap screenshot retention, and never log cookies or auth tokens."],
+        ["Test data and safe environments", "Use dedicated test accounts and seeded staging/sandbox data. The system can prove it reached a checkout boundary; it must not cross into real purchase."],
+        ["Auth and sessions", "A human handles OTP/CAPTCHA once; encrypted per-tenant sessions are refreshed safely. Account-level controls stay on the deny-list."],
+        ["CI and release gates", "Start in recommend mode, then earn blocking gates only after confidence and flake metrics hold. Known flaky tests should not block good releases blindly."],
+    ], [43*mm, 135*mm]))
+
+    section(story, "14. What I would refuse to ship")
     story.append(styled_table([
         ["Refusal", "Why, and what must exist first"],
         ["A path that can click final purchase", "Money pages must be structurally incapable of final submit; red-team it until it cannot buy."],
@@ -605,7 +783,7 @@ def build():
     ], [64*mm, 114*mm]))
     story.append(P("The hardest problem is knowing the system is wrong before a human notices. The architecture answers with deterministic floors under the fuzzy parts, confidence that is measured rather than assumed, canaries between model changes and customers, and a graph that remembers what used to be true so drift is visible.", "Callout"))
 
-    section(story, "13. How Part A grounds every claim")
+    section(story, "15. How Part A grounds every claim")
     story.append(styled_table([
         ["Production claim", "Prototype seed"],
         ["Planner / Crawler split; graph plans, browser acts", "GraphGuidedExplorer._autonomous_loop; BrowserUseIntentExecutor"],
@@ -617,8 +795,15 @@ def build():
         ["PR blast radius traversal", "pr_blast_radius.py; GraphStore.blast_radius"],
         ["Provenance and confidence on writes", "write_intent; write_observation"],
     ], [82*mm, 96*mm]))
+    story.append(P("A concrete run makes the point clearer.", "Subsection"))
+    bullets(story, [
+        "<b>Discovered by the crawler:</b> Add to Cart works, and the quantity stepper moves. The Validator confirmed this by re-reading the actual cart.",
+        "<b>Inferred by the graph:</b> Proceeding to checkout should reach the checkout boundary. The free crawl saw the control but never proved the effect.",
+        "<b>Why the graph inferred it:</b> action.proceed_to_checkout SHOULD_CAUSE domain.checkout_boundary. Observed cause, expected effect, no proof.",
+        "<b>What happened next:</b> the graph turned that gap into a directed probe, the browser clicked Proceed, and the run reached the real checkout boundary.",
+    ])
 
-    section(story, "14. The stack, and why")
+    section(story, "16. The stack, and why")
     story.append(styled_table([
         ["Layer", "Start with", "Avoid"],
         ["Agent harness", "Custom harness over LangGraph primitives; Temporal for durable runs", "A fully autonomous agent with no state/replay contract"],

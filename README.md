@@ -236,7 +236,7 @@ src/
     blast_radius.py             # the PR-impact logic
   reporting/report.py           # the human-readable run report
 scripts/                        # login, crawl, inspect, blast-radius, build-the-PDF
-tests/                          # 54 unit tests (no browser/network/Neo4j needed)
+tests/                          # 61 unit tests (no browser/network/Neo4j needed)
 docs/                           # architecture notes, sample output, Part B PDF
 ```
 
